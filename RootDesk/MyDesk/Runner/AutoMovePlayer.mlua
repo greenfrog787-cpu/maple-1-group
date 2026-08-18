@@ -1,0 +1,225 @@
+@Logic
+script AutoMovePlayer extends Logic
+
+	property boolean cameraFixed = false
+
+	-- Measured free-run speed of MoveToDirection under this map's InputSpeed.
+	-- EnforceScroll() tops the player up to exactly this, so the world advances
+	-- at a constant rate no matter what the avatar's animation is doing.
+	property number RunSpeed = 1.76
+
+	property number lastX = 0.0
+
+	-- Camera follow smoothing. Kept at 0 (rigid 1:1 follow). A non-zero value was
+	-- tried while the ground-twitch was being chased and it behaves as a time
+	-- constant, not a rate: against a constant 1.76 u/s run it built up a steady
+	-- lag that pushed the player to the right edge of the screen. The twitch is
+	-- fixed properly by AirPushForce matching air speed to ground speed instead.
+	property number CameraDamping = 0.0
+
+	-- Vertical DeadZone as a fraction of the view. 0 makes the camera copy the
+	-- player's height exactly, which is what pushed the ground and clouds down
+	-- during jumps; 0.45 comfortably exceeds a jump's ~0.28 share of the view.
+	property number CameraDeadZoneY = 0.45
+
+	-- Per-frame forward force applied while airborne so flight matches the ~1.77
+	-- u/s ground run. Tuned on AIRBORNE-ONLY samples: earlier numbers that
+	-- averaged over the whole 1.2 s window were badly inflated by the landing
+	-- catch-up teleport (it covers ~2 units in a few frames) and made a 0.72 u/s
+	-- flight look like 1.99. Airborne-only measurements, jump peak 2.00 at every
+	-- level: 0.05 -> 0.73, 0.15 -> 2.33, 0.3 -> 2.96, 0.5 -> 3.40 u/s.
+	-- 0.11 interpolates onto the ground speed, so the player neither lags the
+	-- camera (reads as jumping backwards) nor surges past it.
+	property number AirPushForce = 0.11
+
+	-- Set once EnsureFacingRight has handed the facing lock to the server.
+	property boolean facingLocked = false
+
+	-- Cached avatar root entity. The RENDER-side flip lives on this entity's
+	-- Scale.x -- see EnforceAvatarFacing for why that matters.
+	property any avatarRoot = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		        -- Freeze the run once the game is over so the world stops behind the
+		        -- game-over window instead of scrolling on under it.
+		        if _RhythmLogic ~= nil and _RhythmLogic.gameOver then return end
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+
+		        -- One-time camera fix: zero damping/deadzone, and pin the player near the
+		        -- left 1/5 of the screen so more of the track ahead is visible for dodging.
+		        if not self.cameraFixed then
+		            local cam = player:GetComponent("CameraComponent")
+		            if cam ~= nil then
+		                cam.Damping = Vector2(self.CameraDamping, self.CameraDamping)
+		                -- X stays 0 so the camera tracks the run exactly. Y must NOT
+		                -- be 0: DeadZone is the band in which the camera holds its
+		                -- target, and zeroing it made the camera match the player's
+		                -- height 1:1, so every jump slid the ground and the static
+		                -- clouds down the screen. The engine default is only 0.08;
+		                -- a 2.0-unit jump is ~28% of the 7.2-unit-tall view, so the
+		                -- band has to be wider than that to swallow a jump entirely.
+		                cam.DeadZone = Vector2(0.0, self.CameraDeadZoneY)
+		                cam.ScreenOffset = Vector2(0.2, 0.655)
+		                self.cameraFixed = true
+		            end
+		        end
+
+		        local mc = player:GetComponent("MovementComponent")
+		        local rb = player:GetComponent("RigidbodyComponent")
+		        local grounded = rb ~= nil and rb:IsOnGround()
+
+		        -- Called airborne too. Skipping it mid-air was tried and measured
+		        -- worse: air speed fell 1.33 -> 0.64 u/s and backward frames rose
+		        -- 20 -> 26, so it contributes to air movement rather than fighting
+		        -- the jump's forward launch.
+		        if mc ~= nil then mc:MoveToDirection(Vector2(1, 0), delta) end
+		        -- MOVE is unmapped in RhythmLogic.StripActionSheet(), so entering it
+		        -- paints nothing -- but the controller still needs the state to let
+		        -- MoveToDirection actually build walking velocity.
+		        local sc = player:GetComponent("StateComponent")
+		        if sc ~= nil and grounded and sc.CurrentStateName == "IDLE" then
+		            sc:ChangeState("MOVE")
+		        end
+
+		        -- The engine roots the avatar while an attack clip plays: measured
+		        -- 1.76 u/s free-running vs 0.57 u/s mid-swing, and StateComponent even
+		        -- drops to IDLE. That stall is what freezes the camera -- and with it
+		        -- the ground tiles -- while the separately-scrolling background keeps
+		        -- moving, so the player reads as standing still mid-action.
+		        -- Fix: never let world X fall behind RunSpeed. Only shortfalls are
+		        -- topped up, so normal running is untouched and the ground scrolls at
+		        -- one constant rate through swings.
+		        -- Must go through MovementComponent:SetWorldPosition, not a direct
+		        -- TransformComponent.Position write: this Logic's OnUpdate runs before
+		        -- component updates, so the Rigidbody would overwrite a raw transform
+		        -- write later in the same frame (measured: still 0.27 u/s mid-swing).
+		        --
+		        -- GROUNDED ONLY. SetWorldPosition is a teleport that resets velocity;
+		        -- running it every frame in mid-air flattened the jump to a 0.011-unit
+		        -- hop (vs 2.0 when skipped). Since all forward motion here is
+		        -- teleport-driven -- measured MoveVelocity is 0, MoveToDirection alone
+		        -- yields 2.5e-05 u/s -- the player leaves the ground with no momentum
+		        -- and only reaches ~1.3 u/s in the air. Against a camera still gliding
+		        -- at RunSpeed that reads as the player sliding backwards mid-jump, so
+		        -- the air phase is topped up with force instead (see below).
+		        local pos = player.TransformComponent.WorldPosition
+		        if self.lastX == 0.0 then
+		            self.lastX = pos.x
+		        elseif not grounded then
+		            -- Air: accelerate with AddForce, never SetWorldPosition. Force
+		            -- leaves vertical velocity alone, so the jump arc is untouched --
+		            -- measured peak stays 2.00 at every force level, while air speed
+		            -- goes 1.30 (no force) -> 2.45 (0.5) -> 3.52 (2.0) u/s and the
+		            -- backward frames collapse from 20 to 1.
+		            local v = (pos.x - self.lastX) / delta
+		            if v < self.RunSpeed and rb ~= nil then
+		                rb:AddForce(Vector2(self.AirPushForce, 0))
+		            end
+		            self.lastX = pos.x
+		        else
+		            local expected = self.lastX + self.RunSpeed * delta
+		            if pos.x < expected and mc ~= nil then
+		                mc:SetWorldPosition(Vector2(expected, pos.y))
+		                self.lastX = expected
+		            else
+		                self.lastX = pos.x
+		            end
+		        end
+
+		        -- Face the direction of travel (always right in this game).
+		        -- This used to write ctrl.LookDirectionX = 1 here every frame and the
+		        -- avatar still rendered facing LEFT: LookDirectionX is a @Sync property,
+		        -- so a client-side write never reaches the server and the synced default
+		        -- (-1 = left) keeps winning. The write has to happen server-side.
+		        self:EnsureFacingRight()
+		        self:EnforceAvatarFacing()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnforceAvatarFacing()
+		        -- The one that actually turns the character around.
+		        --
+		        -- The engine mirrors an avatar by negating **Scale.x on the AVATAR ROOT
+		        -- entity**, and that value does NOT follow PlayerControllerComponent.
+		        -- Measured in play: LookDirectionX = 1 and IsFaceLeft() = false (both
+		        -- saying "right") while the avatar root sat at Scale.x = -1 and the
+		        -- character visibly ran backwards. Two screenshots settled which is
+		        -- which: Scale.x = -1 -> sword on the left, facing LEFT;
+		        --        Scale.x = +1 -> sword on the right, facing RIGHT.
+		        --
+		        -- That is why the earlier LookDirectionX / FixedLookAt fixes "passed"
+		        -- on logs and changed nothing on screen: they moved the logical facing,
+		        -- never the render transform. Checked every frame (cheap sign test)
+		        -- because state changes repaint the avatar and can restore the mirror.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        if self.avatarRoot == nil or not isvalid(self.avatarRoot) then
+		            local ar = player.AvatarRendererComponent
+		            if ar == nil then return end
+		            self.avatarRoot = ar:GetAvatarRootEntity()
+		        end
+		        if self.avatarRoot == nil or not isvalid(self.avatarRoot) then return end
+		        local t = self.avatarRoot.TransformComponent
+		        if t.Scale.x < 0.0 then
+		            t.Scale = Vector3(-t.Scale.x, t.Scale.y, t.Scale.z)
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureFacingRight()
+		        -- Idempotent client entry point: fires the server-side lock exactly once
+		        -- per session, so callers (here and RhythmLogic:FaceRight) can call it
+		        -- freely without spending an RPC per beat.
+		        if self.facingLocked then return end
+		        self.facingLocked = true
+		        self:LockFacingRight()
+		        -- The server write has to round-trip back as a @Sync update before the
+		        -- avatar re-orients, so the confirmation log waits a beat. faceLeft must
+		        -- read false here -- that is the evidence the lock actually took.
+		        local verifyFunc = function()
+		            local p = _UserService.LocalPlayer
+		            if p == nil or not isvalid(p) then return end
+		            local m = p:GetComponent("MovementComponent")
+		            local c = p.PlayerControllerComponent
+		            local faceLeft = "?"
+		            if m ~= nil then faceLeft = tostring(m:IsFaceLeft()) end
+		            local dir = "?"
+		            if c ~= nil then dir = tostring(c.LookDirectionX) end
+		            log("[AutoMovePlayer] facing check (client) faceLeft=" .. faceLeft
+		                .. " LookDirectionX=" .. dir)
+		        end
+		        _TimerService:SetTimerOnce(verifyFunc, 1.0)
+	end
+
+	@ExecSpace("Server")
+	method void LockFacingRight()
+		        -- Writes the two @Sync facing properties on the requesting player from
+		        -- the server, where they actually stick.
+		        --   LookDirectionX = 1 -> face right now
+		        --   FixedLookAt    = 1 -> pin it there, so nothing flips the avatar back
+		        --                         (arrow keys, knockback, a swing clip).
+		        local player = _UserService:GetUserEntityByUserId(senderUserId)
+		        if player == nil or not isvalid(player) then
+		            log("[AutoMovePlayer] LockFacingRight: no player for userId=" .. tostring(senderUserId))
+		            return
+		        end
+		        local ctrl = player.PlayerControllerComponent
+		        if ctrl == nil or not isvalid(ctrl) then
+		            log("[AutoMovePlayer] LockFacingRight: PlayerControllerComponent missing")
+		            return
+		        end
+		        -- FixedLookAt FIRST, and to 0. Previous attempt set it to 1 and the
+		        -- avatar still rendered facing LEFT: the engine doc says the property
+		        -- makes "the direction of the moving animation not change even if the
+		        -- character changes direction" -- i.e. it pins the CURRENT facing, not
+		        -- "right". Setting it to 1 while the synced value was still the default
+		        -- -1 therefore nailed the avatar to the left. Unlock first, then steer.
+		        ctrl.FixedLookAt = 0
+		        ctrl.LookDirectionX = 1
+		        log("[AutoMovePlayer] facing set right (server) LookDirectionX="
+		            .. tostring(ctrl.LookDirectionX) .. " FixedLookAt=" .. tostring(ctrl.FixedLookAt))
+	end
+
+end

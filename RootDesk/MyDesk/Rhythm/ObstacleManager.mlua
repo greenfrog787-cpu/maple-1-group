@@ -1,0 +1,494 @@
+@Logic
+script ObstacleManager extends Logic
+
+	-- Note: the auto-spawn machinery this manager started life with (its own
+	-- interval timer, concurrency cap, stagger window, and difficulty tiers) was
+	-- removed when spawning became the exclusive job of RhythmLogic:SpawnNote --
+	-- anything that could silently drop a spawn breaks the 1 note = 1 hazard
+	-- pairing. The properties that fed it are gone with it; do not reintroduce
+	-- them without re-reading the RequestSpawn comment.
+
+	-- Small drop height for monsters so they settle onto the foothold instead of
+	-- spawning clipped into it. Kept low -- the old 2.0 left them hanging in air.
+	property number MonsterSpawnY = 0.5
+
+	property number HitRange = 1.3
+
+	property number FractionPerHit = 0.06
+
+	-- God mode. Used to live on the client as RhythmLogic.DEBUG_MODE, which only
+	-- suppressed a second, display-only HP counter -- the real server HP kept
+	-- draining, so "invincible" still died. Now it sits where HP is actually owned.
+	property boolean Invincible = false
+
+	property number CleanupBehind = 4.0
+
+	-- How close a target must be for an on-beat press to destroy it, in world units.
+	-- Must mirror the note's judgment window, not the spawn distance: at 12.0 a
+	-- press destroyed whatever was frontmost within 12 units -- which is the
+	-- obstacle that had *just spawned* 10 units out (measured dx=9.97) -- while the
+	-- one actually arriving went unhit and hit the player. RhythmLogic's GOOD
+	-- window is 60 UI px = 60 / UI_PX_PER_WORLD_UNIT = 0.4 units, so 1.0 covers it
+	-- with margin while staying nowhere near the spawn distance.
+	property number ClearRange = 1.0
+
+	property number ObstacleInterval = 1.6
+
+	property integer MaxConcurrentObstacles = 2
+
+	property number SpawnStagger = 0.5
+
+	property number nextSpawnAllowedAt = 0.0
+
+	property number gameElapsed = 0.0
+
+	property number lastGroundedY = 0.0
+
+	property number Tier1Duration = 20.0
+
+	property number Tier2Duration = 40.0
+
+	property number JumpClearHeightLow = 0.55
+
+	property number JumpClearHeightHigh = 1.3
+
+	property string ObstacleModelLow = "obstaclelow"
+
+	property string ObstacleModelHigh = "obstaclehigh"
+
+	-- The shipped monster models leave SpriteRUID empty, and an empty SpriteRUID
+	-- renders nothing (no error) -- on screen the monsters were just grey specks.
+	-- These are the "move" animationclips from the mob resource packs, one per
+	-- monster lane so left and right read as different enemies.
+	--   lane 2 -> Slime (mob/0210100.img)
+	--   lane 3 -> Weirdo Horny Mushroom (mob/2300101.img)
+	property string MonsterSpriteLane2 = "dc932872543f4a02bf41e977ab79e5ad"
+
+	property string MonsterSpriteLane3 = "c91bc6d0618c4590b42ad383a6ca44d9"
+
+	property any obstacleSprites = nil
+
+	property any mushroomPalette = nil
+
+	property any targets = nil
+
+	property any mapEntity = nil
+
+	property integer spawnCounter = 0
+
+	property number obstacleTimer = 0.0
+
+	property boolean active = false
+
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		        -- Server-side init of target tracking.
+		        self.targets = {}
+		        self.spawnCounter = 0
+		        self.obstacleTimer = 0.0
+		        self.gameElapsed = 0.0
+		        self.nextSpawnAllowedAt = 0.0
+		        self.lastGroundedY = 0.0
+		        -- pivotNy = pivot height as a fraction of the sprite's own height (0=bottom, 1=top).
+		        -- Needed to keep the sprite's visual bottom edge flush with the ground after scaling,
+		        -- since these sprites are not bottom-pivoted (center-ish pivots leave a floating gap).
+		        self.obstacleSprites = {
+		            { ruid = "53092a0ecf39426ab1a1e5a56664daea", heightPx = 116, pivotNy = 0.4914 },  -- barrel
+		            { ruid = "c0346a562fa1436eb18855ddc46d6cd6", heightPx = 124, pivotNy = 0.2339 },  -- cactus
+		            { ruid = "af921b2251574675834981e2394e05d1", heightPx = 160, pivotNy = 0.5000 },  -- spike trap
+		        }
+		        -- Cosmetic color variety for mushroom spawns.
+		        self.mushroomPalette = {
+		            Color(1.0, 1.0, 1.0, 1.0),
+		            Color(1.0, 0.55, 0.55, 1.0),
+		            Color(0.55, 1.0, 0.55, 1.0),
+		            Color(0.6, 0.6, 1.0, 1.0),
+		            Color(1.0, 0.95, 0.4, 1.0),
+		            Color(1.0, 0.6, 1.0, 1.0),
+		        }
+		        self.mapEntity = _EntityService:GetEntityByPath("/maps/map01")
+		        log("[ObstacleManager] OnBeginPlay (server) map=" .. tostring(self.mapEntity ~= nil))
+	end
+
+	method string PickMonsterModel(integer lane)
+		        -- Fixed model per lane so each key reads as its own enemy.
+		        --
+		        -- The previous version drew from a pool that started as { "mushroom" }.
+		        -- No mushroom model exists in this project -- only ChaseMonster.model and
+		        -- MoveMonster.model do -- so every spawn in the first Tier1Duration
+		        -- seconds failed with [LEA-3028] MissingModel and no monster appeared.
+		        if lane == 3 then return "chasemonster" end
+		        return "movemonster"
+	end
+
+	method any FindPlayer(string userId)
+		        -- Returns the requesting player's entity (fallback: first player on the map).
+		        if self.mapEntity == nil or not isvalid(self.mapEntity) then return nil end
+		        local mapComp = self.mapEntity.MapComponent
+		        if mapComp == nil then return nil end
+		        local users = _UserService:GetUsersByMapComponent(mapComp)
+		        if users == nil or #users == 0 then return nil end
+		        if userId ~= nil and userId ~= "" then
+		            for i = 1, #users do
+		                local pc = users[i].PlayerComponent
+		                if isvalid(pc) and pc.UserId == userId then return users[i] end
+		            end
+		        end
+		        return users[1]
+	end
+
+	@ExecSpace("ServerOnly")
+	method void Neutralize(Entity entity)
+		        -- Disable built-in chase/wander/attack so a monster is a pure rhythm target.
+		        local ai1 = entity.AIChaseComponent
+		        if ai1 ~= nil then ai1.Enable = false end
+		        local ai2 = entity.AIWanderComponent
+		        if ai2 ~= nil then ai2.Enable = false end
+		        local atk = entity:GetComponent("script.MonsterAttack")
+		        if atk ~= nil then atk.Enable = false end
+		        -- Both shipped monster models carry a DamageSkinSpawnerComponent with no
+		        -- skin RUID configured, which logs "Invalid RUID Format ... your RUID was
+		        -- null". Damage numbers are meaningless here anyway -- these are rhythm
+		        -- targets that die to a note, not to HP loss.
+		        local skin = entity:GetComponent("DamageSkinSpawnerComponent")
+		        if skin ~= nil then skin.Enable = false end
+		        -- Same story for the other two RUID-less presentation components the
+		        -- shipped models carry. chasemonster in particular logged
+		        -- "Invalid RUID Format ... your RUID was null" on EVERY spawn, which
+		        -- buried real errors in the console. None of them are wanted here:
+		        -- kills go through RequestClear (bypassing HitComponent entirely) and
+		        -- the lane's own slash VFX already carries the impact.
+		        local skinComp = entity:GetComponent("DamageSkinComponent")
+		        if skinComp ~= nil then skinComp.Enable = false end
+		        local hitFx = entity:GetComponent("HitEffectSpawnerComponent")
+		        if hitFx ~= nil then hitFx.Enable = false end
+		        local skinSetting = entity:GetComponent("DamageSkinSettingComponent")
+		        if skinSetting ~= nil then skinSetting.Enable = false end
+		        -- No HitEffectSpawnerComponent here. It used to be added for hit VFX, but
+		        -- these models ship without an effect RUID, so every spawn logged
+		        -- "Invalid RUID Format ... your RUID was null". Nothing needed it either:
+		        -- kills go through RequestClear, which bypasses HitComponent entirely,
+		        -- and the lane's own slash effect already carries the impact.
+	end
+
+	method integer CountActiveObstacles()
+		        -- Live (unhit) ground obstacles currently tracked, used for the concurrency cap.
+		        local count = 0
+		        if self.targets == nil then return 0 end
+		        for i = 1, #self.targets do
+		            local ob = self.targets[i]
+		            if ob.kind == "obstacle" and not ob.hit then
+		                count = count + 1
+		            end
+		        end
+		        return count
+	end
+
+	@ExecSpace("Server")
+	method void RequestSpawn(integer lane, number spawnX)
+		        -- Client (RhythmLogic) requests the hazard paired with one arrow. This is
+		        -- the ONLY spawn entry point, so no hazard can appear without its note.
+		        --
+		        -- spawnX is an absolute world X computed by the client. The client owns
+		        -- the run, so only it knows the player's true position and how far ahead
+		        -- the hazard must start to meet the player exactly when its arrow reaches
+		        -- the judgment line.
+		        --
+		        -- Every request spawns, unconditionally: the old stagger window and the
+		        -- concurrency cap could silently drop one, which would leave an arrow with
+		        -- no hazard under it and break the 1:1 pairing the timing relies on.
+		        --
+		        -- One hazard type per lane, so the player can read which key is coming
+		        -- from the world as well as from the arrow:
+		        --   1 (up)    tall obstacle    3 (right) chasemonster
+		        --   2 (left)  movemonster      4 (down)  low obstacle
+		        if self.targets == nil then self.targets = {} end
+		        self.active = true
+		        if lane == 2 or lane == 3 then
+		            self:SpawnMonster(lane, spawnX, self:PickMonsterModel(lane))
+		        else
+		            self:SpawnObstacle(lane, spawnX, lane == 1)
+		        end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnObstacle(integer lane, number spawnX, boolean isHigh)
+		        -- Ground obstacle for a lane, destroyed by that lane's on-beat attack.
+		        -- isHigh picks the silhouette (tall for up, low for down) rather than
+		        -- being random, so the obstacle matches the key it belongs to.
+		        local player = self:FindPlayer(nil)
+		        if player == nil then return end
+		        local map = self.mapEntity
+		        if map == nil or not isvalid(map) then return end
+		        local ppos = player.TransformComponent.WorldPosition
+		        local groundY = self.lastGroundedY
+		        self.spawnCounter = self.spawnCounter + 1
+		        local modelId = self.ObstacleModelLow
+		        local requiredHeight = self.JumpClearHeightLow
+		        if isHigh then
+		            modelId = self.ObstacleModelHigh
+		            requiredHeight = self.JumpClearHeightHigh
+		        end
+		        local name = modelId .. "_" .. tostring(self.spawnCounter)
+		        local entity = _SpawnService:SpawnByModelId(modelId, name, Vector3(spawnX, groundY, 0), map)
+		        if entity == nil then
+		            log("[ObstacleManager] OBSTACLE SPAWN FAILED model=" .. modelId)
+		            return
+		        end
+		        -- Variety: pick a random sprite for this obstacle instance, then compensate its
+		        -- Y position for the sprite's own pivot so the bottom edge sits flush on the
+		        -- ground regardless of the model's Scale (fixes floating/gapped obstacles).
+		        local variant = 1
+		        if self.obstacleSprites ~= nil and #self.obstacleSprites > 0 then
+		            variant = _UtilLogic:RandomIntegerRange(1, #self.obstacleSprites)
+		            local sprite = self.obstacleSprites[variant]
+		            local sr = entity.SpriteRendererComponent
+		            if sr ~= nil then sr.SpriteRUID = sprite.ruid end
+		            local scaleY = entity.TransformComponent.Scale.y
+		            local groundOffset = sprite.pivotNy * (sprite.heightPx / 100.0) * scaleY
+		            entity.TransformComponent.Position = Vector3(spawnX, groundY + groundOffset, 0)
+		        end
+		        table.insert(self.targets, { entity = entity, lane = lane, hit = false, kind = "obstacle", baseY = groundY, dodged = false, requiredHeight = requiredHeight })
+		        -- serverPlayerX is logged to expose any client/server position drift:
+		        -- the client's own X is what spawnX was derived from.
+		        log("[ObstacleManager] obstacle lane=" .. tostring(lane) .. " model=" .. modelId
+		            .. " variant=" .. tostring(variant)
+		            .. " spawnX=" .. tostring(spawnX) .. " serverPlayerX=" .. tostring(ppos.x))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnMonster(integer lane, number spawnX, string modelId)
+		        -- Monster hazard for a lane. Spawned at the same client-computed spawnX
+		        -- as an obstacle would be, and Neutralized so it holds that spot: the
+		        -- arrow/hazard pairing only survives if the target does not wander.
+		        local map = self.mapEntity
+		        if map == nil or not isvalid(map) then return end
+		        local groundY = self.lastGroundedY
+		        self.spawnCounter = self.spawnCounter + 1
+		        local name = modelId .. "_m_" .. tostring(self.spawnCounter)
+		        local entity = _SpawnService:SpawnByModelId(
+		            modelId, name, Vector3(spawnX, groundY + self.MonsterSpawnY, 0), map)
+		        if entity == nil then
+		            log("[ObstacleManager] MONSTER SPAWN FAILED lane=" .. tostring(lane) .. " model=" .. modelId)
+		            return
+		        end
+		        self:Neutralize(entity)
+		        -- Give it a visible body. Without this the model's empty SpriteRUID
+		        -- leaves nothing on screen but the shadow layer.
+		        local sr = entity.SpriteRendererComponent
+		        if sr ~= nil then
+		            if lane == 3 then
+		                sr.SpriteRUID = self.MonsterSpriteLane3
+		            else
+		                sr.SpriteRUID = self.MonsterSpriteLane2
+		            end
+		            -- Assets face left by MSW convention; these come at the player from
+		            -- the right, so leave the default. Flip only if that ever changes.
+		        end
+		        table.insert(self.targets, { entity = entity, lane = lane, hit = false, kind = "monster", baseY = groundY })
+		        log("[ObstacleManager] monster lane=" .. tostring(lane) .. " model=" .. modelId
+		            .. " spawnX=" .. tostring(spawnX))
+	end
+
+	@ExecSpace("Server")
+	method void RequestClear(integer lane)
+		        -- Player hit the note in time -> destroy the frontmost live target of that
+		        -- lane. Obstacles count as well as monsters: the Up lane no longer clears
+		        -- its obstacle by jumping over it (that desynced the obstacle from its
+		        -- arrow while airborne), the player smashes it with a blast instead.
+		        if self.targets == nil then return end
+		        local player = self:FindPlayer(senderUserId)
+		        local px = 0.0
+		        if player ~= nil then px = player.TransformComponent.WorldPosition.x end
+		        -- Pick the nearest live target of the lane, with no distance gate: the
+		        -- note's own judgment window already decided this press was on time, so
+		        -- re-testing the obstacle's world distance would only re-introduce the
+		        -- drift this design exists to avoid.
+		        local bestIdx, bestDx = 0, 9999.0
+		        for i = 1, #self.targets do
+		            local ob = self.targets[i]
+		            if ob.lane == lane and not ob.hit and isvalid(ob.entity) then
+		                local dx = ob.entity.TransformComponent.WorldPosition.x - px
+		                if math.abs(dx) < math.abs(bestDx) then
+		                    bestDx = dx
+		                    bestIdx = i
+		                end
+		            end
+		        end
+		        if bestIdx > 0 then
+		            local ob = self.targets[bestIdx]
+		            ob.hit = true
+		            if isvalid(ob.entity) then
+		                -- Rhythm-timed defeats bypass HitComponent/HitEvent entirely, so trigger
+		                -- the monster's own hit-flash directly to give the kill visible impact.
+		                -- Destroy is delayed briefly so the @Sync flash has time to reach the client.
+		                local monsterComp = ob.entity:GetComponent("script.Monster")
+		                if monsterComp ~= nil then
+		                    monsterComp.hitFlashTick = monsterComp.hitFlashTick + 1
+		                end
+		                local entityToDestroy = ob.entity
+		                local destroyFunc = function()
+		                    if isvalid(entityToDestroy) then entityToDestroy:Destroy() end
+		                end
+		                _TimerService:SetTimerOnce(destroyFunc, 0.12)
+		            end
+		            table.remove(self.targets, bestIdx)
+		            log("[ObstacleManager] destroyed " .. tostring(ob.kind) .. " lane=" .. tostring(lane)
+		                .. " dx=" .. tostring(bestDx))
+		        end
+	end
+
+	@ExecSpace("Server")
+	method void RequestMiss(integer lane)
+		        -- The arrow for this lane crossed the judgment line un-hit. Charge the
+		        -- player for it and remove the obstacle it was paired with, so the
+		        -- penalty lands on the beat the player actually missed rather than
+		        -- whenever the obstacle happens to be physically adjacent.
+		        if self.targets == nil then return end
+		        local player = self:FindPlayer(senderUserId)
+		        if player == nil then return end
+		        local px = player.TransformComponent.WorldPosition.x
+		        local bestIdx, bestAbs = 0, 9999.0
+		        for i = 1, #self.targets do
+		            local ob = self.targets[i]
+		            if ob.lane == lane and not ob.hit and isvalid(ob.entity) then
+		                local adx = math.abs(ob.entity.TransformComponent.WorldPosition.x - px)
+		                if adx < bestAbs then
+		                    bestAbs = adx
+		                    bestIdx = i
+		                end
+		            end
+		        end
+		        if bestIdx == 0 then return end
+		        local ob = self.targets[bestIdx]
+		        ob.hit = true
+		        self:DamagePlayer(player.PlayerComponent)
+		        if isvalid(ob.entity) then ob.entity:Destroy() end
+		        table.remove(self.targets, bestIdx)
+		        log("[ObstacleManager] missed lane=" .. tostring(lane) .. " -> damaged, obstacle removed")
+	end
+
+	@ExecSpace("Server")
+	method void RequestClearAll()
+		        -- Restart / game over -> wipe all targets, restore player HP, and reset the
+		        -- difficulty ramp / spawn stagger so a new run starts from tier 1.
+		        if self.targets ~= nil then
+		            for i = 1, #self.targets do
+		                local ob = self.targets[i]
+		                if ob.entity ~= nil and isvalid(ob.entity) then ob.entity:Destroy() end
+		            end
+		        end
+		        self.targets = {}
+		        self.obstacleTimer = 0.0
+		        self.gameElapsed = 0.0
+		        self.nextSpawnAllowedAt = 0.0
+		        self.active = false
+		        local player = self:FindPlayer(senderUserId)
+		        if player ~= nil then
+		            local pc = player.PlayerComponent
+		            if isvalid(pc) then
+		                pc.Hp = pc.MaxHp
+		                self:NotifyHp(pc.MaxHp, pc.MaxHp, pc.UserId)
+		            end
+		        end
+		        log("[ObstacleManager] cleared all")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DamagePlayer(PlayerComponent pc)
+		        -- Apply a small one-shot chip of HP; running out ends the run.
+		        if pc == nil or not isvalid(pc) then return end
+		        if self.Invincible then
+		            log("[ObstacleManager] damage ignored (Invincible)")
+		            return
+		        end
+		        local dmg = math.floor(pc.MaxHp * self.FractionPerHit)
+		        if dmg < 1 then dmg = 1 end
+		        local newHp = pc.Hp - dmg
+		        if newHp <= 0 then
+		            -- Used to Respawn() and silently refill here, which is why dying
+		            -- never showed the game-over window: the panel is driven by
+		            -- RhythmLogic.hp (note misses only, and suppressed by DEBUG_MODE),
+		            -- so nothing on the client ever learned the player had died.
+		            -- HP is restored by RequestClearAll on restart, not here.
+		            pc.Hp = 0
+		            self:NotifyHp(0, pc.MaxHp, pc.UserId)
+		            log("[ObstacleManager] player HP depleted -> game over")
+		            self:NotifyPlayerDead(pc.UserId)
+		        else
+		            pc.Hp = newHp
+		            self:NotifyHp(newHp, pc.MaxHp, pc.UserId)
+		            log("[ObstacleManager] collision -dmg=" .. tostring(dmg) .. " Hp=" .. tostring(newHp))
+		        end
+	end
+
+	@ExecSpace("Client")
+	method void NotifyHp(number hp, number maxHp)
+		        -- Server -> owning client. The HP bar lives in RhythmLogic (client), so
+		        -- every write to PlayerComponent.Hp has to be mirrored across explicitly.
+		        _RhythmLogic:SetHpDisplay(hp, maxHp)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyPlayerDead()
+		        -- Server -> owning client. The game-over UI lives in RhythmLogic, which
+		        -- is client-side, so death has to cross the boundary explicitly.
+		        _RhythmLogic:TriggerGameOver()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		        if self.targets == nil then return end
+		        local player = self:FindPlayer(nil)
+		        if player == nil then return end
+
+		        local ppos = player.TransformComponent.WorldPosition
+		        local px = ppos.x
+		        local py = ppos.y
+
+		        -- Track the last Y the player was actually standing on a foothold, so spawns
+		        -- and dodge-height checks use a stable ground reference instead of the player's
+		        -- live (possibly mid-air) Y -- this is what previously caused obstacles/monsters
+		        -- to spawn floating whenever the timer fired while the player was jumping.
+		        local rb = player:GetComponent("RigidbodyComponent")
+		        if rb ~= nil and rb:IsOnGround() then
+		            self.lastGroundedY = py
+		        end
+
+		        -- Difficulty clock only. Obstacles are NOT auto-spawned any more: every
+		        -- hazard must be announced by an Up-arrow note, so spawning is driven
+		        -- exclusively by RhythmLogic through RequestSpawn().
+		        if self.active then
+		            self.gameElapsed = self.gameElapsed + delta
+		        end
+
+		        if #self.targets == 0 then return end
+		        local pc = player.PlayerComponent
+
+		        local i = #self.targets
+		        while i >= 1 do
+		            local ob = self.targets[i]
+		            if ob.entity == nil or not isvalid(ob.entity) then
+		                table.remove(self.targets, i)
+		            else
+		                local ox = ob.entity.TransformComponent.WorldPosition.x
+		                -- Obstacles deliberately do NOT damage on contact any more.
+		                -- Physical arrival and the arrow's arrival at the judgment line
+		                -- could not be held together: measured, the obstacle reached the
+		                -- player a beat and a half early (miss-window dx settled on
+		                -- multiples of SPAWN_INTERVAL * RunSpeed), so contact damage
+		                -- punished the player before their cue was even due.
+		                -- Judgment now belongs entirely to the note: RequestClear
+		                -- destroys the obstacle on a hit, RequestMiss does the damage on
+		                -- a miss. Here we only sweep up what has gone past.
+		                if ox < px - self.CleanupBehind then
+		                    if isvalid(ob.entity) then ob.entity:Destroy() end
+		                    table.remove(self.targets, i)
+		                end
+		            end
+		            i = i - 1
+		        end
+	end
+
+end

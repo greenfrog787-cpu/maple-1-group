@@ -1,0 +1,1598 @@
+@Logic
+script RhythmLogic extends Logic
+
+	-- Geometry (all UI px, every box uses pivot 0.5 so these are CENTER coords):
+	--   KeyFlash box : center x = -550, width 120  -> spans [-610, -490]
+	--   Note box     : center x = noteX, width  80 -> spans [noteX-40, noteX+40]
+	-- Overlap(noteX) = 80 (full) when |noteX - JUDGE_X| <= 20
+	--                = 40 (half) when |noteX - JUDGE_X| == 60
+	-- So GOOD == "at least half the arrow is inside the box".
+	property number JUDGE_X = -550.0
+
+	property number PERFECT_WINDOW = 20.0
+
+	property number GOOD_WINDOW = 60.0
+
+	-- Overwritten in OnBeginPlay from RunSpeed -- see UI_PX_PER_WORLD_UNIT.
+	property number NOTE_SPEED = 95.0
+
+	-- UI pixels per world unit: the 1920-wide canvas covers 12.8 world units of
+	-- camera view, so 150. Note it is NOT the engine's usual 100 px/unit -- that
+	-- is the asset scale, this is what one screen actually shows at this zoom.
+	--
+	-- Locking NOTE_SPEED to RunSpeed * this makes an arrow and the ground travel
+	-- the same fraction of the screen per second. Without it the ground scrolled
+	-- 13.75%/s against the arrows' 4.95%/s, so an obstacle could be timed to
+	-- arrive with its arrow but would visibly drift against it on the way in.
+	property number UI_PX_PER_WORLD_UNIT = 150.0
+
+	-- Judgment windows as authored. Stage 4 tightens them (see stagePerfectWindow /
+	-- stageGoodWindow), and RestartGame has to be able to put them back.
+	property number BASE_PERFECT_WINDOW = 20.0
+
+	property number BASE_GOOD_WINDOW = 60.0
+
+	--   BlastWave : 1180x536, 20 frames -- screen-spanning shockwave. At full size
+	--   it covers the whole view, so BlastScale trims it to a Up-lane "blast".
+	property string BlastWave = "03e614a531294810b235012af9064541"
+
+	property number BlastScale = 0.24
+
+	property number SPAWN_INTERVAL = 1.5
+
+	-- HP is now owned end-to-end by the server (ObstacleManager -> PlayerComponent.Hp)
+	-- and pushed here purely for display. There used to be a second, client-side HP
+	-- counter here that ticked down 10 per miss and was suppressed by a DEBUG_MODE
+	-- flag -- so the bar and the actual death condition were two different numbers.
+	-- The god-mode switch moved with the ownership: ObstacleManager.Invincible.
+	property number HP_BAR_FULL_WIDTH = 412.0
+
+	-- Ground obstacles on the Up lane. Monsters stay out for now -- this pass is
+	-- only testing that an obstacle tracks its arrow (see ObstacleManager).
+	property boolean HAZARDS_ENABLED = true
+
+	property number FEEDBACK_DURATION = 0.5
+
+	-- Long enough for the flash to read as a beat rather than a single frame.
+	property number KEY_FLASH_DURATION = 0.18
+
+	-- Judge-box brightness. The box is now always on screen (idle) so the player
+	-- can see WHERE to hit; a press ramps it to BRIGHT and it fades back.
+	property number KEY_FLASH_IDLE_ALPHA = 0.22
+
+	property number KEY_FLASH_BRIGHT_ALPHA = 0.92
+
+	-- Per-lane accent, matched to the slash VFX each lane already throws so the
+	-- arrow, the judge box and the effect all read as one colour.
+	property any laneColors = nil
+
+	-- Hit SFX. Found via msw-search (resource type "effect" = audio).
+	--   SfxHit     0.44s metallic slash  -- short enough to fire on every beat
+	--   SfxPerfect 0.91s bright chime    -- layered ON TOP of SfxHit, Perfect only
+	--   SfxMiss    0.89s error blip
+	--   SfxCombo   1.58s celebratory sting, every ComboMilestone
+	property string SfxHit = "df9c5ddbc2f849609cf7c9dc3ce1dfc9"
+
+	property string SfxPerfect = "796a7d6af19d4dff8d265bd4f768f21d"
+
+	property string SfxMiss = "174d501eccd04eadbd6c6411d4ade7e7"
+
+	property string SfxCombo = "c6813615a6fc4850b907302a698ffae5"
+
+	property number SfxHitVolume = 0.55
+
+	property number SfxPerfectVolume = 0.4
+
+	property number SfxMissVolume = 0.5
+
+	property number SfxComboVolume = 0.6
+
+	property integer ComboMilestone = 10
+
+	-- BGM, one track per stage. The music gets heavier as the chart gets harder so
+	-- the escalation is audible, not just visible.
+	--   1 밝은 신스 (115s) -> 2 록/오케 (92s) -> 3 긴박한 오케 (93s) -> 4 강렬한 일렉기타 (45s)
+	property string BgmStage1 = "fb2ae50a8aeb49c29c04bc3db91e7e6a"
+
+	property string BgmStage2 = "32330a23b78a4c9cbc56e9d05d985a06"
+
+	property string BgmStage3 = "dd94f8153ab94cf8807de5327aa5c5f7"
+
+	property string BgmStage4 = "563451bdf50146279f110e8dadb56875"
+
+	property number BgmVolume = 0.45
+
+	-- Beat grid. Note spawning used to be a bare seconds timer, which is why the
+	-- notes never lined up with anything musical. SPAWN_INTERVAL is now DERIVED:
+	--     SPAWN_INTERVAL = (60 / BPM) * BeatsPerNote
+	-- so every note lands on a beat of the track instead of on an arbitrary clock.
+	--
+	-- ⚠ BPM is a starting value, not a measurement -- it has to be tuned by ear
+	-- against BgmStage1. Nothing else in the game depends on it: the arrow/hazard
+	-- pairing is held by NOTE_SPEED = RunSpeed x UI_PX_PER_WORLD_UNIT, which is
+	-- independent of how often notes spawn. Changing BPM only changes density.
+	property number BPM = 120.0
+
+	-- Beats between consecutive notes, per difficulty. Smaller = denser.
+	property number BeatsPerNoteEasy = 2.0
+
+	property number BeatsPerNoteNormal = 1.5
+
+	property number BeatsPerNoteHard = 1.0
+
+	-- ── Stage table (4 stages) ────────────────────────────────────────────────
+	-- Difficulty picks the STARTING point; the stage picks how far up the ramp we
+	-- are. Four separate axes escalate together so later stages feel different,
+	-- not merely faster:
+	--   1 WARM-UP      느린 스크롤 · 넓은 간격 · 단순 패턴만        (레인/타이밍 학습)
+	--   2 ACCELERATION 스크롤↑ · 간격↓ · 교차 패턴 추가            (손이 레인 사이를 오감)
+	--   3 RUSH         스크롤↑↑ · 간격↓↓ · 전체 패턴 해금          (복합 입력)
+	--   4 FINAL        스크롤 최대 · 간격 최소 · 판정 윈도우 축소   (정확도 요구)
+	property integer MAX_STAGE = 4
+
+	-- Score needed to ENTER each stage. Index 1 is unused (stage 1 is the start).
+	property any stageScoreGate = nil
+
+	-- Ground-scroll multiplier, applied on top of the difficulty multiplier.
+	-- Always computed from BASE_RUN_SPEED, never from the live value -- multiplying
+	-- the live RunSpeed compounds and a restart would inherit the boost.
+	property any stageSpeedMult = nil
+
+	-- Beats between notes. nil on stage 1 = "use the difficulty's own value".
+	property any stageBeats = nil
+
+	-- Which note patterns are unlocked. Indices into notePatterns.
+	property any stagePatternPool = nil
+
+	-- Per-stage judgment windows (stage 4 tightens).
+	property any stagePerfectWindow = nil
+
+	property any stageGoodWindow = nil
+
+	property any stageBgm = nil
+
+	property any stageName = nil
+
+	-- Remembered from ApplyDifficulty so stage changes can rebuild from the
+	-- difficulty baseline instead of stacking on whatever is currently live.
+	property number difficultySpeedMult = 1.0
+
+	property number difficultyBeats = 1.5
+
+	-- Hit stop, counted in FRAMES rather than seconds. SetClientTimeScale slows
+	-- the client clock, so a seconds-based timer would be stretched by the very
+	-- slowdown it is supposed to end (a 0.05s restore at scale 0.15 would take
+	-- a third of a second of real time). Frames keep ticking at render rate, so
+	-- the stop always lasts exactly as long as it looks like it does.
+	-- Never scale to 0: OnUpdate is what counts the frames down.
+	property integer hitStopFrames = 0
+
+	property number HIT_STOP_SCALE_PERFECT = 0.15
+
+	property number HIT_STOP_SCALE_GOOD = 0.35
+
+	property integer HIT_STOP_FRAMES_PERFECT = 5
+
+	property integer HIT_STOP_FRAMES_GOOD = 3
+
+	-- Camera shake. Miss shakes hardest -- it is the one that should feel bad.
+	property number ShakePerfect = 0.5
+
+	property number ShakeGood = 0.25
+
+	property number ShakeMiss = 0.85
+
+	property number ShakeDuration = 0.14
+
+	-- Scale-pop timers for the judgment text and the combo counter. Both count
+	-- down in OnUpdate and drive UITransformComponent.UIScale.
+	property number feedbackPopTimer = 0.0
+
+	property number comboPopTimer = 0.0
+
+	property number POP_DURATION = 0.18
+
+	property number POP_SCALE = 1.55
+
+	property integer score = 0
+
+	property integer combo = 0
+
+	property number spawnTimer = 0.0
+
+	property number feedbackTimer = 0.0
+
+	property any noteEntities = nil
+
+	property any noteActive = nil
+
+	property any noteX = nil
+
+	property any noteLane = nil
+
+	property any laneY = nil
+
+	property any keyFlashEntities = nil
+
+	property any keyFlashTimers = nil
+
+	property any scoreEntity = nil
+
+	property any comboEntity = nil
+
+	property any feedbackEntity = nil
+
+	property any hpBarFillEntity = nil
+
+	-- Game-over screen. UUIDs are injected by the UI builder's binding pass, so
+	-- these need no drag-binding in Maker.
+	property Entity gameOverPanel = "b999f6bc-1c15-49c1-9116-0d1fa66cc83f"
+
+	property ButtonComponent btnRestart = "e97d78e4-ba2d-4090-a366-3c1d404e3756"
+
+	property ButtonComponent btnHome = "aa038d5c-6f94-4758-b2e2-49d0e0d57b5c"
+
+	-- Menu scene the Home button returns to. Kept in sync with TitleScreen's own
+	-- MenuMapName -- both must name the same map for the round trip to work.
+	property string MenuMapName = "mainmenu"
+
+	property Vector3 MenuSpawnPos = Vector3(0, 1, 0)
+
+	property any restartHandler = nil
+
+	property any homeHandler = nil
+
+	property any gameOverEntity = nil
+
+	property any restartHintEntity = nil
+
+	property integer hp = 100
+
+	property integer MAX_HP = 100
+
+	property boolean gameOver = false
+
+	-- The title screen owns the transition into play. Until TitleScreen:OnStartPressed
+	-- calls StartGame, notes neither spawn nor move and the lane keys do nothing --
+	-- the auto-run keeps going, so the live world doubles as the title backdrop.
+	property boolean gameStarted = false
+
+	-- "easy" / "normal" / "hard", picked on the title screen. Survives restarts so
+	-- the game-over Restart button replays the same tier.
+	property string difficulty = "normal"
+
+	-- AutoMovePlayer.RunSpeed as authored, captured before any difficulty or Stage 2
+	-- multiplier touches it. ApplyDifficulty scales from this, never from the live
+	-- value -- otherwise each restart after a Stage 2 boost would compound.
+	property number BASE_RUN_SPEED = 1.76
+
+	property integer stage = 1
+
+	property number stageBannerTimer = 0.0
+
+	property number STAGE_BANNER_DURATION = 2.5
+
+	property any darkOverlayEntity = nil
+
+	property any stageBannerEntity = nil
+
+	property any keyHandler = nil
+
+	property integer noteCounter = 0
+
+	-- Note charts. Lanes used to be math.random(1,4) per note, which is
+	-- unmemorizable by construction -- nothing to learn, so nothing to get better
+	-- at. These are short phrases the player can recognise and anticipate;
+	-- SpawnNote walks one to the end, then draws another at random.
+	property any notePatterns = nil
+
+	property any currentPattern = nil
+
+	property integer patternIndex = 0
+
+	property integer airJumpsUsed = 0
+
+	property integer maxAirJumps = 1
+
+	property number DoubleJumpRate = 2.4
+
+	-- Tall obstacles need ~1.3 world units of clearance (ObstacleManager.JumpClearHeightHigh),
+	-- and the screen is only 7.2 units tall. Measured: rate 1.9 -> 4.21 unit peak (too high),
+	-- and height scales with rate^2, so 1.3 lands near a ~2 unit peak.
+	property number HighJumpRate = 1.3
+
+	-- Horizontal launch component for jumps. Compensates for the run being
+	-- teleport-driven (no real velocity to carry into the air) -- see DoHighJump.
+	property number JumpForwardRate = 2.0
+
+	-- Ground locomotion animation is driven manually instead of by the state
+	-- machine (see StripActionSheet). The avatar body can only ever play ONE
+	-- action clip -- CoreActionName is the bare body and PartsActionName is the
+	-- equipped gear, NOT upper/lower body -- so a true "run + swing" composite is
+	-- impossible. Instead the player keeps physically running (background scrolls,
+	-- hazards keep approaching) while the swing clip briefly replaces the run clip.
+	-- runLoopActive tracks whether the walk Loop is currently the live clip, so we
+	-- only re-send it on transitions (re-sending every frame would restart it at
+	-- frame 0 and freeze the animation).
+	property boolean runLoopActive = false
+
+	-- Seconds a lane swing owns the body before the run loop resumes.
+	property number ACTION_HOLD_DURATION = 0.45
+
+	-- Playback rate for the walk cycle used as the run animation (engine MOVE = 1.68).
+	property number RUN_RATE = 2.4
+
+	-- Slash VFX (animationclip, category "skill") played on top of each swing so the
+	-- attacks don't read as bare avatar poses. Both were picked by rendering
+	-- candidates in-game and comparing screenshots.
+	--   SlashArcBlue  : 131x94, 7 frames -- tight blue crescent with sparkles
+	--   SlashArcOrange: 215x175, 6 frames -- wider warm double-crescent
+	property string SlashArcBlue = "ffaf507b148744f49715a8253477fec0"
+
+	property string SlashArcOrange = "34cee7428d694e3a91e8a4aca8dd04ac"
+
+	--   SlashArcCyan  : 219x187, 6 frames -- big cyan/white swirl that starts right
+	--   at the sword, so it hugs the player more closely than the other two.
+	property string SlashArcCyan = "11453a10e5374d9f95f226990c9d7b30"
+
+	-- Where the arc sits relative to the player, in world units (1 unit = 100 px).
+	-- Found by rendering the clip in-game and screenshotting: at (0, 0.6) scale 1
+	-- the arc sweeps up and to the right out of the player, which already reads as
+	-- a right-facing attack. These clips carry large per-frame pivot offsets (one
+	-- frame is 4x4 px at pivot 201,-165), so nudging the offset moves the visual
+	-- much further than expected -- re-check with a screenshot after any change.
+	property number SlashOffsetX = 0.0
+
+	property number SlashOffsetY = 0.6
+
+	property number SlashScale = 1.0
+
+	-- How long the looping slash arc stays up before RemoveEffect tears it down.
+	-- Roughly matches ACTION_HOLD_DURATION so the VFX and the swing pose end together.
+	property number SlashEffectDuration = 0.4
+
+	property number actionHoldTimer = 0.0
+
+	property boolean measuringHighJump = false
+
+	property number jumpSeqBaseY = 0.0
+
+	property number jumpSeqPeakY = 0.0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		        log("[RhythmLogic] OnBeginPlay")
+		        self.laneY = { -270.0, -340.0, -430.0, -500.0 }
+		        self.noteEntities = {}
+		        self.noteActive = {}
+		        self.noteX = {}
+		        self.noteLane = {}
+		
+		        -- Note groups carry a fixed arrow glyph: A="<-", S="v", D="^", F="->".
+		        -- Required lane order (top->bottom): 1="^", 2="<-", 3="->", 4="v".
+		        local noteNames = { "D", "A", "F", "S" }
+		        -- KeyFlash boxes have their own fixed Y, so their order is unchanged.
+		        local flashNames = { "A", "S", "D", "F" }
+		        for lane = 1, 4 do
+		            for i = 0, 4 do
+		                local idx = (lane - 1) * 5 + i + 1
+		                local path = "/ui/RhythmGame/Note_" .. noteNames[lane] .. "_" .. tostring(i)
+		                local entity = _EntityService:GetEntityByPath(path)
+		                self.noteEntities[idx] = entity
+		                self.noteActive[idx] = false
+		                self.noteX[idx] = 950.0
+		                self.noteLane[idx] = lane
+		                if entity == nil then
+		                    log("[RhythmLogic] note entity missing: " .. path)
+		                end
+		            end
+		        end
+		
+		        -- Lane accents, same order as laneY. Kept in sync with the .ui pass
+		        -- and with each lane's slash VFX so arrow, box and effect match.
+		        self.laneColors = {
+		            Color(1.00, 0.85, 0.25, 1.0),   -- 1 up    (gold,   BlastWave)
+		            Color(0.38, 0.68, 1.00, 1.0),   -- 2 left  (blue,   SlashArcBlue)
+		            Color(1.00, 0.58, 0.25, 1.0),   -- 3 right (orange, SlashArcOrange)
+		            Color(0.35, 0.95, 0.95, 1.0),   -- 4 down  (cyan,   SlashArcCyan)
+		        }
+
+		        -- Key flash panels. These now stay ON at a dim idle alpha instead of
+		        -- being Enable=false until pressed -- an invisible target box was the
+		        -- main reason the lanes were unreadable.
+		        self.keyFlashEntities = {}
+		        self.keyFlashTimers = { 0.0, 0.0, 0.0, 0.0 }
+		        for lane = 1, 4 do
+		            local path = "/ui/RhythmGame/KeyFlash_" .. flashNames[lane]
+		            local fe = _EntityService:GetEntityByPath(path)
+		            self.keyFlashEntities[lane] = fe
+		            if fe ~= nil and isvalid(fe) then
+		                fe.Enable = true
+		            end
+		            self:SetLaneFlashAlpha(lane, self.KEY_FLASH_IDLE_ALPHA)
+		        end
+		        self:BuildNotePatterns()
+		        self:BuildStageTable()
+		        log("[RhythmLogic] lane boxes armed (idle alpha="
+		            .. tostring(self.KEY_FLASH_IDLE_ALPHA) .. ")")
+		
+		        self.scoreEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/ScoreText")
+		        self.comboEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/ComboText")
+		        self.feedbackEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/JudgmentFeedback")
+		        -- Nested under HPBarBg so the fill inherits the bar's transform; the
+		        -- lookup path has to include the parent.
+		        self.hpBarFillEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/HPBarBg/HPBarFill")
+		        self.gameOverEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/GameOverText")
+		        self.restartHintEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/RestartHint")
+		        self.darkOverlayEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/DarkOverlay")
+		        self.stageBannerEntity = _EntityService:GetEntityByPath("/ui/RhythmGame/Stage2Banner")
+		        log("[RhythmLogic] scoreEntity=" .. tostring(self.scoreEntity ~= nil))
+		        log("[RhythmLogic] hpBarFill=" .. tostring(self.hpBarFillEntity ~= nil))
+		        log("[RhythmLogic] darkOverlay=" .. tostring(self.darkOverlayEntity ~= nil))
+		
+		        -- ScoreText is anchored top-centre in the .ui now, so no runtime
+		        -- repositioning: the old Vector2(0, -80) write assumed a centre anchor
+		        -- and would drag the HUD back down into the play field.
+		        if self.comboEntity ~= nil then
+		            local rt = self.comboEntity:GetComponent("UITransformComponent")
+		            if rt ~= nil then
+		                rt.anchoredPosition = Vector2(0, 80)
+		                log("[RhythmLogic] ComboText repositioned to bottom-center")
+		            end
+		        end
+		
+		        -- Make feedback text large and readable with black outline.
+		        -- Parked just above the lane stack rather than screen centre: the
+		        -- player's eyes are on the judge box, and a verdict that appears
+		        -- where they are already looking reads on the beat instead of
+		        -- after it.
+		        if self.feedbackEntity ~= nil then
+		            local rt = self.feedbackEntity:GetComponent("UITransformComponent")
+		            if rt ~= nil then
+		                rt.RectSize = Vector2(560, 120)
+		                rt.anchoredPosition = Vector2(-300, -150)
+		            end
+		            local ft = self.feedbackEntity:GetComponent("TextComponent")
+		            if ft ~= nil then
+		                ft.FontSize = 72
+		                ft.Bold = true
+		                ft.UseOutLine = true
+		                ft.OutlineColor = Color(0.0, 0.0, 0.0, 1.0)
+		                ft.OutlineWidth = 3
+		            end
+		        end
+		
+		        -- PlayerControllerComponent.LookDirectionX defaults to -1 (facing left).
+		        -- Right is "front" in this game, so force it once at start.
+		        self:FaceRight()
+		        -- IDLE/MOVE are unmapped, so nothing else will ever paint the run pose.
+		        self:StartRunLoop()
+		        -- Tie note speed to the ground scroll so arrows and obstacles move
+		        -- across the screen together rather than at independent rates.
+		        -- Snapshot the authored run speed before anything scales it, so
+		        -- ApplyDifficulty always has a clean baseline to multiply.
+		        self.BASE_RUN_SPEED = self:GetRunSpeed()
+		        self.NOTE_SPEED = self:GetRunSpeed() * self.UI_PX_PER_WORLD_UNIT
+		        log("[RhythmLogic] NOTE_SPEED locked to ground scroll = " .. tostring(self.NOTE_SPEED))
+
+		        -- Equip a one-handed sword so ATTACK actions resolve to visible sword
+		        -- swings/stabs (bare-hand ATTACK falls back to 'alert' which looks
+		        -- identical to idle). Also drop the ATTACK / CROUCH entries from the
+		        -- ActionSheet so the state-machine's per-frame reassert doesn't
+		        -- overwrite our one-shot ActionStateChangedEvent.
+		        self:EquipRhythmWeapon()
+		        self:StripActionSheet()
+
+		        -- Subscribe to keyboard events via _InputService (global emitter for all key input)
+		        self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+		        log("[RhythmLogic] KeyDownEvent connected via _InputService")
+
+		        -- Game-over window starts hidden; its buttons are wired once here and
+		        -- stay connected, so showing the panel is all TriggerGameOver has to do.
+		        if self.gameOverPanel ~= nil and isvalid(self.gameOverPanel) then
+		            self.gameOverPanel.Enable = false
+		        end
+		        self:WireGameOverButtons()
+		
+		        self.score = 0
+		        self.combo = 0
+		        self.hp = 100
+		        self.gameOver = false
+		        -- Hold at the title until TitleScreen calls StartGame.
+		        self.gameStarted = false
+		        self.stage = 1
+		        self.stageBannerTimer = 0.0
+		        self.spawnTimer = 0.0
+		        self.feedbackTimer = 0.0
+		        self.noteCounter = 0
+		        self.airJumpsUsed = 0
+		        self:UpdateScoreUI()
+		        self:UpdateComboUI()
+		        self:UpdateHPBar()
+		        log("[RhythmLogic] waiting on title screen (gameStarted=false)")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		        -- Hit stop runs above every other guard, including gameOver and the
+		        -- title-screen return below: whatever else happens, the client clock
+		        -- must come back to 1.0 or the whole game stays in slow motion.
+		        if self.hitStopFrames > 0 then
+		            self.hitStopFrames = self.hitStopFrames - 1
+		            if self.hitStopFrames <= 0 then
+		                self:ClearHitStop()
+		            end
+		        end
+		        -- Scale pops are driven here too so they keep animating during the
+		        -- hit stop they were fired by (that overlap is the whole effect).
+		        self:UpdatePops(delta)
+		        self:UpdateLaneFlash(delta)
+
+		        if self.actionHoldTimer > 0.0 then
+		            self.actionHoldTimer = self.actionHoldTimer - delta
+		            if self.actionHoldTimer < 0.0 then self.actionHoldTimer = 0.0 end
+		        end
+		        -- Reset the double-jump allowance whenever the player is back on a foothold.
+		        local player = _UserService.LocalPlayer
+		        if player ~= nil and isvalid(player) then
+		            local rb = player:GetComponent("RigidbodyComponent")
+		            if rb ~= nil then
+		                -- TEMP: track this jump sequence's peak height (remove after calibration)
+		                local dy = player.TransformComponent.WorldPosition.y - self.jumpSeqBaseY
+		                if dy > self.jumpSeqPeakY then self.jumpSeqPeakY = dy end
+		                local grounded = rb:IsOnGround()
+		                if grounded then
+		                    if self.measuringHighJump and self.jumpSeqPeakY > 0.05 then
+		                        log("[RhythmLogic] MEASURED high-jump peak = " .. tostring(self.jumpSeqPeakY))
+		                    elseif self.airJumpsUsed > 0 and self.jumpSeqPeakY > 0.05 then
+		                        log("[RhythmLogic] MEASURED jump sequence peak = " .. tostring(self.jumpSeqPeakY))
+		                    end
+		                    self.measuringHighJump = false
+		                    self.airJumpsUsed = 0
+		                    self.jumpSeqPeakY = 0.0
+		                end
+		                -- Resume the run loop once the body is free: on the ground and
+		                -- no swing still holding it. Airborne keeps the jump/fall pose.
+		                if grounded and self.actionHoldTimer <= 0.0 then
+		                    if not self.runLoopActive then self:StartRunLoop() end
+		                else
+		                    self.runLoopActive = false
+		                end
+		            end
+		        end
+
+		        if self.gameOver then return end
+		        -- Everything above this line (run loop, jump grounding) keeps running
+		        -- while the title screen is up, so the world scrolls behind it. Only
+		        -- the rhythm track itself waits for StartGame.
+		        if not self.gameStarted then return end
+		        -- Move active notes and check miss
+		        for i = 1, 20 do
+		            if self.noteActive[i] then
+		                self.noteX[i] = self.noteX[i] - self.NOTE_SPEED * delta
+		                local entity = self.noteEntities[i]
+		                if entity ~= nil and isvalid(entity) then
+		                    local rt = entity:GetComponent("UITransformComponent")
+		                    if rt ~= nil then
+		                        rt.anchoredPosition = Vector2(self.noteX[i], self.laneY[self.noteLane[i]])
+		                    end
+		                    -- Miss once the box overlap drops back under half (noteX is the CENTER).
+		                    if self.noteX[i] < self.JUDGE_X - self.GOOD_WINDOW then
+		                        self.noteActive[i] = false
+		                        entity.Enable = false
+		                        self:OnMiss(self.noteLane[i])
+		                    end
+		                else
+		                    self.noteActive[i] = false
+		                end
+		            end
+		        end
+		
+		        -- (lane flash fade now lives in UpdateLaneFlash, called at the top of
+		        --  OnUpdate so the boxes keep breathing on the title screen too)
+		
+		        -- Feedback timer countdown
+		        if self.feedbackTimer > 0.0 then
+		            self.feedbackTimer = self.feedbackTimer - delta
+		            if self.feedbackTimer <= 0.0 then
+		                self.feedbackTimer = 0.0
+		                self:SetFeedbackText("")
+		            end
+		        end
+		
+		        -- Stage 2 banner countdown
+		        if self.stageBannerTimer > 0.0 then
+		            self.stageBannerTimer = self.stageBannerTimer - delta
+		            if self.stageBannerTimer <= 0.0 then
+		                self.stageBannerTimer = 0.0
+		                if self.stageBannerEntity ~= nil and isvalid(self.stageBannerEntity) then
+		                    self.stageBannerEntity.Enable = false
+		                end
+		            end
+		        end
+		
+		        -- Spawn timer
+		        self.spawnTimer = self.spawnTimer + delta
+		        if self.spawnTimer >= self.SPAWN_INTERVAL then
+		            self.spawnTimer = 0.0
+		            self:SpawnNote()
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SpawnNote()
+		        local lane = self:NextPatternLane()
+		        local startIdx = (lane - 1) * 5 + 1
+		        for i = startIdx, startIdx + 4 do
+		            if not self.noteActive[i] then
+		                local entity = self.noteEntities[i]
+		                if entity ~= nil and isvalid(entity) then
+		                    self.noteX[i] = 950.0
+		                    self.noteActive[i] = true
+		                    entity.Enable = true
+		                    local rt = entity:GetComponent("UITransformComponent")
+		                    if rt ~= nil then
+		                        rt.anchoredPosition = Vector2(950.0, self.laneY[lane])
+		                    end
+		                end
+		                -- Every lane gets a paired hazard, not just Up: ObstacleManager
+		                -- picks the type from the lane (obstacle for up/down, monster for
+		                -- left/right), so each arrow has something in the world to hit.
+		                if self.HAZARDS_ENABLED then
+		                    -- Spatially lock the hazard to this arrow. Because NOTE_SPEED
+		                    -- is derived from the ground scroll, the arrow's remaining UI
+		                    -- distance converts straight into world units: spawn the
+		                    -- hazard that far ahead and the two travel in step.
+		                    local leadDistance = (950.0 - self.JUDGE_X) / self.UI_PX_PER_WORLD_UNIT
+		                    -- Send an absolute spawn X, not just the lead. The server used
+		                    -- to read the player's position itself, but the run is driven
+		                    -- client-side, so the server's copy trails behind.
+		                    local px = _UserService.LocalPlayer.TransformComponent.WorldPosition.x
+		                    _ObstacleManager:RequestSpawn(lane, px + leadDistance)
+		                    log("[RhythmLogic] Note+Hazard spawn lane=" .. tostring(lane))
+		                else
+		                    log("[RhythmLogic] Note-only spawn lane=" .. tostring(lane))
+		                end
+		                return
+		            end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent e)
+		        -- Title screen owns the keyboard until Start is pressed; ignoring
+		        -- input here keeps a stray Space from jumping behind the dimmer.
+		        if not self.gameStarted then return end
+		        -- Space = jump only
+		        if e.key == KeyboardKey.Space then
+		            if self.gameOver then
+		                self:RestartGame()
+		            else
+		                self:DoJump()
+		            end
+		            return
+		        end
+		        if self.gameOver then return end
+		        local laneIdx = 0
+		        if e.key == KeyboardKey.UpArrow then laneIdx = 1
+		        elseif e.key == KeyboardKey.LeftArrow then laneIdx = 2
+		        elseif e.key == KeyboardKey.RightArrow then laneIdx = 3
+		        elseif e.key == KeyboardKey.DownArrow then laneIdx = 4
+		        end
+		        if laneIdx == 0 then return end
+		        self:FlashKey(laneIdx)
+		        self:HitLane(laneIdx)
+		        self:PlayLaneAction(laneIdx)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FlashKey(integer laneIdx)
+		        -- Punches the box to full brightness; UpdateLaneFlash fades it back to
+		        -- idle. No Enable toggle -- the box must stay on screen at all times.
+		        self:SetLaneFlashAlpha(laneIdx, self.KEY_FLASH_BRIGHT_ALPHA)
+		        self.keyFlashTimers[laneIdx] = self.KEY_FLASH_DURATION
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetLaneFlashAlpha(integer laneIdx, number alpha)
+		        -- Only the alpha moves; the hue is the lane's fixed accent colour.
+		        if self.laneColors == nil then return end
+		        local fe = self.keyFlashEntities[laneIdx]
+		        if fe == nil or not isvalid(fe) then return end
+		        local sg = fe:GetComponent("SpriteGUIRendererComponent")
+		        if sg == nil then return end
+		        local c = self.laneColors[laneIdx]
+		        sg.Color = Color(c.r, c.g, c.b, alpha)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateLaneFlash(number delta)
+		        -- Linear fade from BRIGHT back down to IDLE over KEY_FLASH_DURATION.
+		        if self.keyFlashTimers == nil then return end
+		        for lane = 1, 4 do
+		            local t = self.keyFlashTimers[lane]
+		            if t > 0.0 then
+		                t = t - delta
+		                if t < 0.0 then t = 0.0 end
+		                self.keyFlashTimers[lane] = t
+		                local k = t / self.KEY_FLASH_DURATION
+		                local a = self.KEY_FLASH_IDLE_ALPHA
+		                    + (self.KEY_FLASH_BRIGHT_ALPHA - self.KEY_FLASH_IDLE_ALPHA) * k
+		                self:SetLaneFlashAlpha(lane, a)
+		            end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer NextPatternLane()
+		        -- Hands out the next lane of the current phrase, drawing a fresh phrase
+		        -- once the current one runs out. Lane numbers are 1=up 2=left 3=right
+		        -- 4=down, so a rising staircase reads as ▼▶◀▲ on screen.
+		        if self.notePatterns == nil then self:BuildNotePatterns() end
+		        if self.stagePatternPool == nil then self:BuildStageTable() end
+		        if self.currentPattern == nil or self.patternIndex > #self.currentPattern then
+		            -- Draw only from the phrases this stage has unlocked, so stage 1
+		            -- stays teachable and later stages introduce the awkward ones.
+		            local pool = self.stagePatternPool[self.stage]
+		            if pool == nil then pool = self.stagePatternPool[1] end
+		            local pick = pool[_UtilLogic:RandomIntegerRange(1, #pool)]
+		            self.currentPattern = self.notePatterns[pick]
+		            self.patternIndex = 1
+		        end
+		        local lane = self.currentPattern[self.patternIndex]
+		        self.patternIndex = self.patternIndex + 1
+		        return lane
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BuildStageTable()
+		        -- Four axes escalate per stage. Kept as parallel arrays indexed by
+		        -- stage number so adding a 5th stage is one entry per row.
+		        self.stageName        = { "WARM-UP", "ACCELERATION", "RUSH", "FINAL" }
+		        self.stageScoreGate   = { 0, 20000, 50000, 90000 }
+		        self.stageSpeedMult   = { 1.0, 1.3, 1.6, 2.0 }
+		        -- 0 on stage 1 means "keep the difficulty's own beat spacing".
+		        self.stageBeats       = { 0.0, 1.25, 1.0, 0.75 }
+		        -- Pattern indices unlocked per stage (see BuildNotePatterns order).
+		        -- 1,2 staircases · 5,6 repeats = simple    3,4,9 crossing = medium
+		        -- 7,8,10 zigzag/anchor = complex
+		        self.stagePatternPool = {
+		            { 1, 2, 5, 6 },
+		            { 1, 2, 3, 4, 5, 6, 9 },
+		            { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 },
+		            { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 },
+		        }
+		        -- Stage 4 is the only one that demands more accuracy, not just speed.
+		        self.stagePerfectWindow = {
+		            self.BASE_PERFECT_WINDOW, self.BASE_PERFECT_WINDOW,
+		            self.BASE_PERFECT_WINDOW, 14.0,
+		        }
+		        self.stageGoodWindow = {
+		            self.BASE_GOOD_WINDOW, self.BASE_GOOD_WINDOW,
+		            self.BASE_GOOD_WINDOW, 45.0,
+		        }
+		        self.stageBgm = { self.BgmStage1, self.BgmStage2, self.BgmStage3, self.BgmStage4 }
+		        log("[RhythmLogic] stage table built (" .. tostring(self.MAX_STAGE) .. " stages)")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyStage(integer n)
+		        -- Single place that installs a stage. Called on every round start
+		        -- (stage 1) and on every promotion, so the two paths cannot drift.
+		        if self.stageSpeedMult == nil then self:BuildStageTable() end
+		        if n < 1 then n = 1 end
+		        if n > self.MAX_STAGE then n = self.MAX_STAGE end
+		        self.stage = n
+
+		        -- Scroll speed: difficulty baseline x stage multiplier, always from
+		        -- BASE_RUN_SPEED. NOTE_SPEED is then re-derived so the arrow and the
+		        -- ground keep moving at the same screen rate (the pairing invariant).
+		        if _AutoMovePlayer ~= nil then
+		            _AutoMovePlayer.RunSpeed =
+		                self.BASE_RUN_SPEED * self.difficultySpeedMult * self.stageSpeedMult[n]
+		        end
+		        self.NOTE_SPEED = self:GetRunSpeed() * self.UI_PX_PER_WORLD_UNIT
+
+		        -- Note density, still on the beat grid.
+		        local beats = self.stageBeats[n]
+		        if beats <= 0.0 then beats = self.difficultyBeats end
+		        self.SPAWN_INTERVAL = self:BeatsToSeconds(beats)
+
+		        -- Judgment tolerance.
+		        self.PERFECT_WINDOW = self.stagePerfectWindow[n]
+		        self.GOOD_WINDOW = self.stageGoodWindow[n]
+
+		        -- Start the next phrase from the newly unlocked pool.
+		        self.currentPattern = nil
+		        self.patternIndex = 0
+
+		        self:StartBgm(self.stageBgm[n])
+		        log("[RhythmLogic] STAGE " .. tostring(n) .. " " .. tostring(self.stageName[n])
+		            .. " runSpeed=" .. tostring(self:GetRunSpeed())
+		            .. " noteSpeed=" .. tostring(self.NOTE_SPEED)
+		            .. " spawn=" .. tostring(self.SPAWN_INTERVAL)
+		            .. " perfect=" .. tostring(self.PERFECT_WINDOW))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowStageBanner(integer n)
+		        -- Reuses the single banner entity for every stage; the text is set here
+		        -- rather than baked into the .ui.
+		        if self.stageBannerEntity == nil or not isvalid(self.stageBannerEntity) then return end
+		        local t = self.stageBannerEntity:GetComponent("TextComponent")
+		        if t ~= nil then
+		            t.Text = "STAGE " .. tostring(n) .. "  " .. tostring(self.stageName[n])
+		        end
+		        self.stageBannerEntity.Enable = true
+		        self.stageBannerTimer = self.STAGE_BANNER_DURATION
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BuildNotePatterns()
+		        -- Short, recognisable phrases. Kept to 3-6 notes so a phrase finishes
+		        -- inside a couple of seconds and the next one reads as a new bar.
+		        self.notePatterns = {
+		            { 1, 2, 3, 4 },          -- descending staircase
+		            { 4, 3, 2, 1 },          -- ascending staircase
+		            { 2, 3, 2, 3, 2, 3 },    -- left/right trill
+		            { 1, 4, 1, 4 },          -- outer alternation (up/down)
+		            { 2, 2, 2 },             -- left repeat
+		            { 3, 3, 3 },             -- right repeat
+		            { 1, 3, 2, 4 },          -- zigzag
+		            { 1, 4, 2, 3 },          -- outer then inner
+		            { 4, 4, 1, 1 },          -- paired doubles
+		            { 2, 1, 3, 1 },          -- up as the anchor beat
+		        }
+		        self.currentPattern = nil
+		        self.patternIndex = 0
+		        log("[RhythmLogic] note patterns loaded = " .. tostring(#self.notePatterns))
+	end
+
+	@ExecSpace("ClientOnly")
+	method number BeatsToSeconds(number beats)
+		        -- One beat = 60 / BPM seconds. Every spawn interval in the game is
+		        -- expressed in beats and converted here, so the whole chart stays on
+		        -- the grid when BPM is retuned to the actual track.
+		        if self.BPM <= 0.0 then return 1.0 end
+		        return (60.0 / self.BPM) * beats
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartBgm(string ruid)
+		        _SoundService:PlayBGM(ruid, self.BgmVolume)
+		        log("[RhythmLogic] BGM started bpm=" .. tostring(self.BPM)
+		            .. " spawnInterval=" .. tostring(self.SPAWN_INTERVAL))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopBgm()
+		        -- false = fade out rather than cut, so game over does not clip the track.
+		        _SoundService:StopBGM(false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayHitFeel(boolean isPerfect)
+		        -- The three channels of "I hit that": sound, a frozen instant, and a
+		        -- kick. Perfect gets all three harder so the two grades feel
+		        -- different in the hands, not just in the score readout.
+		        _SoundService:PlaySound(self.SfxHit, self.SfxHitVolume)
+		        if isPerfect then
+		            _SoundService:PlaySound(self.SfxPerfect, self.SfxPerfectVolume)
+		            self:StartHitStop(self.HIT_STOP_SCALE_PERFECT, self.HIT_STOP_FRAMES_PERFECT)
+		            self:ShakeCam(self.ShakePerfect)
+		        else
+		            self:StartHitStop(self.HIT_STOP_SCALE_GOOD, self.HIT_STOP_FRAMES_GOOD)
+		            self:ShakeCam(self.ShakeGood)
+		        end
+		        log("[RhythmLogic] hit feel perfect=" .. tostring(isPerfect)
+		            .. " hitStopFrames=" .. tostring(self.hitStopFrames))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayMissFeel()
+		        -- No hit stop on a miss: freezing the screen would reward the mistake
+		        -- with the same weight a Perfect gets. Just a hard shake and a blip.
+		        _SoundService:PlaySound(self.SfxMiss, self.SfxMissVolume)
+		        self:ShakeCam(self.ShakeMiss)
+		        log("[RhythmLogic] miss feel (sfx+shake)")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartHitStop(number scale, integer frames)
+		        -- Never pass 0: OnUpdate is what counts the frames back down, so a
+		        -- fully stopped clock would have nothing left to restore it.
+		        if scale <= 0.0 then scale = 0.1 end
+		        _UtilLogic:SetClientTimeScale(scale)
+		        self.hitStopFrames = frames
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearHitStop()
+		        -- Called from OnUpdate when the frame budget runs out, and from every
+		        -- round-boundary path (game over / restart) so a death mid-stop can
+		        -- never strand the client in slow motion.
+		        self.hitStopFrames = 0
+		        _UtilLogic:SetClientTimeScale(1.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShakeCam(number intensity)
+		        local cam = _CameraService:GetCurrentCameraComponent()
+		        if cam == nil or not isvalid(cam) then return end
+		        cam:ShakeCamera(intensity, self.ShakeDuration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PopFeedback()
+		        self.feedbackPopTimer = self.POP_DURATION
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PopCombo()
+		        self.comboPopTimer = self.POP_DURATION
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdatePops(number delta)
+		        -- Both pops are the same curve: snap to POP_SCALE on the beat, then
+		        -- ease back to 1.0. Scale (not alpha) because it survives being read
+		        -- out of the corner of the eye while the player is watching the lane.
+		        if self.feedbackPopTimer > 0.0 then
+		            self.feedbackPopTimer = self.feedbackPopTimer - delta
+		            if self.feedbackPopTimer < 0.0 then self.feedbackPopTimer = 0.0 end
+		            self:ApplyPopScale(self.feedbackEntity, self.feedbackPopTimer)
+		        end
+		        if self.comboPopTimer > 0.0 then
+		            self.comboPopTimer = self.comboPopTimer - delta
+		            if self.comboPopTimer < 0.0 then self.comboPopTimer = 0.0 end
+		            self:ApplyPopScale(self.comboEntity, self.comboPopTimer)
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyPopScale(any entity, number remain)
+		        -- remain counts DOWN, so k=1 at the instant of the hit and 0 at rest.
+		        if entity == nil or not isvalid(entity) then return end
+		        local rt = entity:GetComponent("UITransformComponent")
+		        if rt == nil then return end
+		        local k = remain / self.POP_DURATION
+		        local s = 1.0 + (self.POP_SCALE - 1.0) * k
+		        rt.UIScale = Vector3(s, s, 1.0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HitLane(integer laneIdx)
+		        local startIdx = (laneIdx - 1) * 5 + 1
+		        local bestIdx = 0
+		        local bestDist = self.GOOD_WINDOW + 1.0
+
+		        for i = startIdx, startIdx + 4 do
+		            if self.noteActive[i] then
+		                -- Both boxes are pivot-centered, so this is the distance between
+		                -- the arrow's center and the key box's center. Anything beyond
+		                -- GOOD_WINDOW overlaps by less than half the arrow -> no hit.
+		                local dist = math.abs(self.noteX[i] - self.JUDGE_X)
+		                if dist <= self.GOOD_WINDOW and dist < bestDist then
+		                    bestDist = dist
+		                    bestIdx = i
+		                end
+		            end
+		        end
+		
+		        if bestIdx > 0 then
+		            self.noteActive[bestIdx] = false
+		            local entity = self.noteEntities[bestIdx]
+		            if entity ~= nil and isvalid(entity) then
+		                entity.Enable = false
+		            end
+		
+		            self.combo = self.combo + 1
+		            local isPerfect = bestDist < self.PERFECT_WINDOW
+		            if isPerfect then
+		                self.score = self.score + 300
+		                self:SetFeedbackColor(Color(1.0, 1.0, 0.2, 1.0))
+		                self:ShowFeedback("PERFECT!")
+		            else
+		                self.score = self.score + 100
+		                self:SetFeedbackColor(Color(0.2, 1.0, 0.4, 1.0))
+		                self:ShowFeedback("GOOD!")
+		            end
+		            -- Sound + hit stop + shake, graded by how clean the hit was.
+		            self:PlayHitFeel(isPerfect)
+		            self:PopCombo()
+		            self:UpdateScoreUI()
+		            self:UpdateComboUI()
+		            -- Hit in time -> defeat the assigned world monster/obstacle for this lane.
+		            _ObstacleManager:RequestClear(laneIdx)
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayLaneAction(integer laneIdx)
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local playerX = player.TransformComponent.WorldPosition.x
+		        -- faceLeft is the facing-lock's evidence line: it must read false once
+		        -- AutoMovePlayer:LockFacingRight has landed on the server.
+		        local faceLeft = "?"
+		        local mc = player:GetComponent("MovementComponent")
+		        if mc ~= nil then faceLeft = tostring(mc:IsFaceLeft()) end
+		        log("[RhythmLogic] Lane " .. tostring(laneIdx) .. " action - Player X = " .. tostring(playerX)
+		            .. " faceLeft=" .. faceLeft)
+		        local sc = player:GetComponent("StateComponent")
+		        if sc == nil then return end
+		        -- Arrow keys are also the engine's default move keys, which flip LookDirectionX.
+		        -- Re-assert facing every beat so the player never turns his back to the notes.
+		        self:FaceRight()
+		        -- Lane 1(^)=high jump. With a one-handed sword equipped the ATTACK
+		        -- body actions resolve to visibly distinct sword motions:
+		        --   Lane 2 (<-) = swingO1 (side slash)
+		        --   Lane 3 (->) = stabO1 (thrust)
+		        --   Lane 4 (v)  = swingO3 (overhead smash)
+		        -- StripActionSheet() removed ATTACK/CROUCH mappings in OnBeginPlay
+		        -- so the state-machine never overwrites these one-shot events.
+		        if laneIdx == 1 then
+		            -- Up used to jump over the obstacle. Dropped: mid-air the player's
+		            -- horizontal speed can't be held exactly at the ground scroll rate,
+		            -- so the obstacle drifted out of line with its arrow during the
+		            -- jump. As a ground attack there is no airborne phase at all and
+		            -- the pairing simply holds. Space still jumps (see DoJump).
+		            -- self:DoHighJump()
+		            self:PlayBodyAction("swingO2", 1.0)
+		            self:PlaySlashEffect(self.BlastWave, self.BlastScale, self.SlashOffsetX)
+		        else
+		            -- The player never stops running -- the swing clip simply takes over
+		            -- the body for ACTION_HOLD_DURATION, then OnUpdate resumes the run
+		            -- loop. Movement continues throughout, so the background keeps
+		            -- scrolling and hazards keep approaching.
+		            -- Each lane also throws its own slash VFX so the attacks don't read
+		            -- as a bare avatar pose. Lanes are told apart by clip and size, not
+		            -- by tint: passing a Color option is what made these effects create
+		            -- successfully (non-zero serial) yet never appear on screen.
+		            if laneIdx == 2 then
+		                self:PlayBodyAction("swingO1", 1.0)
+		                -- Nudged left so the arc sits closer in against the player.
+		                self:PlaySlashEffect(self.SlashArcBlue, self.SlashScale, self.SlashOffsetX - 0.4)
+		            elseif laneIdx == 3 then
+		                self:PlayBodyAction("stabO1", 1.0)
+		                self:PlaySlashEffect(self.SlashArcOrange, self.SlashScale, self.SlashOffsetX)
+		            elseif laneIdx == 4 then
+		                self:PlayBodyAction("swingO3", 1.0)
+		                -- Own clip, not a rescaled blue one: at the same size the two
+		                -- read as the same effect. Pulled left as well -- the cyan
+		                -- swirl otherwise sits noticeably off the player.
+		                self:PlaySlashEffect(self.SlashArcCyan, self.SlashScale, self.SlashOffsetX - 0.5)
+		            end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlaySlashEffect(string ruid, number scale, number offsetX)
+		        -- Attaches a slash animationclip to the player for one playthrough.
+		        -- PlayEffectAttached (not PlayEffect) so the arc rides along with the
+		        -- run instead of being stranded at a world position. No SyncFlip /
+		        -- FlipX: these clips already sweep rightward from the player, and
+		        -- flipping them threw the visual well off the character.
+		        --
+		        -- Played as a LOOP and torn down by timer rather than as a one-shot.
+		        -- A one-shot was created fine (non-zero serial) but never showed on
+		        -- screen: this clip's leading frames are near-empty -- frame 0 is 4x4
+		        -- px against 384x272 for frame 1 -- so a single pass spends most of
+		        -- its time invisible, and lowering PlayRate to 0.3 didn't help.
+		        -- Looping guarantees the big middle frames are on screen for the whole
+		        -- SlashEffectDuration.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local serial = _EffectService:PlayEffectAttached(
+		            ruid, player,
+		            Vector3(offsetX, self.SlashOffsetY, 0),
+		            0,
+		            Vector3(scale, scale, 1),
+		            true,
+		            { SortingLayer = "Foreground", OrderInLayer = 100 })
+		        if serial == 0 then return end
+		        local killFunc = function()
+		            _EffectService:RemoveEffect(serial)
+		        end
+		        _TimerService:SetTimerOnce(killFunc, self.SlashEffectDuration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FaceRight()
+		        -- Right is the direction of travel, and the controller defaults to -1 (left).
+		        -- Delegates to AutoMovePlayer, which owns the facing lock: LookDirectionX is
+		        -- a @Sync property, so setting it from here (client) never reached the server
+		        -- and the synced default kept rendering the avatar facing backwards.
+		        -- EnsureFacingRight is idempotent, so calling it per beat costs one bool test.
+		        if _AutoMovePlayer ~= nil then _AutoMovePlayer:EnsureFacingRight() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EquipRhythmWeapon()
+		        -- Basic one-handed sword (avataritem "검"). Without a weapon, the
+		        -- default ATTACK body action falls back to 'alert' -- indistinguishable
+		        -- from idle -- and 'swingO*'/'stabO*' clips don't render at all. With a
+		        -- one-handed weapon equipped they resolve to visible sword motions.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local cm = player:GetComponent("CostumeManagerComponent")
+		        if cm == nil then return end
+		        cm:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, "9edfb2ac8d4948ae9d6d789c99e0b966")
+		        log("[RhythmLogic] equipped one-handed sword")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StripActionSheet()
+		        -- Two-part fix: (1) drop the state->body-action mappings that the
+		        -- state machine would otherwise re-send every frame and overwrite
+		        -- our one-shot swings; (2) unbind the arrow keys from the engine's
+		        -- default movement/crouch/climb actions so pressing them doesn't
+		        -- also put the player into MOVE/CROUCH.
+		        --
+		        -- Symptom before this fix: swings only rendered when airborne
+		        -- (no MOVE state active). On the ground, holding/pressing an arrow
+		        -- started walking and walk animation clobbered the swing every tick.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local asac = player:GetComponent("AvatarStateAnimationComponent")
+		        if asac ~= nil then
+		            -- Hand ALL ground locomotion animation to this script. With IDLE and
+		            -- MOVE unmapped, no state transition ever repaints the body while the
+		            -- player is running, so a swing clip survives instead of being
+		            -- clobbered by walk on the next tick. StartRunLoop() supplies the run
+		            -- animation instead. JUMP/FALL stay mapped -- airborne poses are still
+		            -- worth letting the state machine drive.
+		            asac:RemoveActionSheet("ATTACK")
+		            asac:RemoveActionSheet("CROUCH")
+		            asac:RemoveActionSheet("IDLE")
+		            asac:RemoveActionSheet("MOVE")
+		        end
+		        local pc = player.PlayerControllerComponent
+		        if pc ~= nil then
+		            -- Arrow keys are rhythm inputs only in this game; the player
+		            -- doesn't need to walk (obstacles come to them).
+		            pc:RemoveActionKey(KeyboardKey.LeftArrow)
+		            pc:RemoveActionKey(KeyboardKey.RightArrow)
+		            pc:RemoveActionKey(KeyboardKey.DownArrow)
+		            pc:RemoveActionKey(KeyboardKey.UpArrow)
+		        end
+		        log("[RhythmLogic] stripped ATTACK/CROUCH mappings and arrow-key bindings")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SendBodyClip(string actionName, number rate, boolean loop)
+		        -- Writes one clip straight to the avatar's body entity. CoreActionName is
+		        -- the bare body and PartsActionName the equipped gear; they must match or
+		        -- the sword renders a different motion than the arm holding it.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local renderer = player.AvatarRendererComponent
+		        if renderer == nil then return end
+		        local body = renderer:GetBodyEntity()
+		        if body == nil or not isvalid(body) then return end
+		        local ev = ActionStateChangedEvent()
+		        ev.CoreActionName = actionName
+		        ev.PartsActionName = actionName
+		        ev.PlayRate = rate
+		        if loop then
+		            ev.PlayType = SpriteAnimClipPlayType.Loop
+		        else
+		            ev.PlayType = SpriteAnimClipPlayType.Onetime
+		        end
+		        body:SendEvent(ev)
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetRunSpeed()
+		        -- Ground scroll speed. Lives on AutoMovePlayer, which owns the run.
+		        if _AutoMovePlayer ~= nil then return _AutoMovePlayer.RunSpeed end
+		        return 1.76
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartRunLoop()
+		        -- Driven manually because IDLE/MOVE were unmapped in StripActionSheet.
+		        -- The MSW avatar has no separate "run" clip -- neither the
+		        -- MapleAvatarBodyActionState enum nor the engine's action-resolution
+		        -- table has one, and ground locomotion is only walk1/walk2. So the run
+		        -- is a sped-up walk: the engine's own MOVE rate is 1.68, and RUN_RATE
+		        -- pushes the same cycle past a walking cadence.
+		        self:SendBodyClip("walk1", self.RUN_RATE, true)
+		        self.runLoopActive = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayBodyAction(string actionName, number rate)
+		        -- A lane swing: takes the body for ACTION_HOLD_DURATION, after which
+		        -- OnUpdate restores the run loop. The player keeps moving the whole time.
+		        self:SendBodyClip(actionName, rate, false)
+		        self.actionHoldTimer = self.ACTION_HOLD_DURATION
+		        self.runLoopActive = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DoHighJump()
+		        -- Lane 1 reward motion: higher than the plain Space jump, but it must stay
+		        -- on screen. Peak height is logged on landing so the rate can be tuned.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local rb = player:GetComponent("RigidbodyComponent")
+		        -- The X component matters: AutoMovePlayer drives the run by teleporting
+		        -- the transform, so the body carries no real horizontal velocity. A
+		        -- purely vertical JustJump therefore left the player momentum-less in
+		        -- mid-air and they drifted backward, sliding the ground to the right.
+		        -- Launching forward gives the air phase its own momentum.
+		        if rb ~= nil then rb:JustJump(Vector2(self.JumpForwardRate, self.HighJumpRate)) end
+		        self.jumpSeqBaseY = player.TransformComponent.WorldPosition.y
+		        self.jumpSeqPeakY = 0.0
+		        self.measuringHighJump = true
+		        local sc = player:GetComponent("StateComponent")
+		        if sc ~= nil then sc:ChangeState("JUMP") end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DoJump()
+		        -- Space jump: rises the player so ObstacleManager's height check clears obstacles.
+		        -- Allows one extra air jump (double jump) for taller obstacles.
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then return end
+		        local rb = player:GetComponent("RigidbodyComponent")
+		        local grounded = rb ~= nil and rb:IsOnGround()
+		        if not grounded and self.airJumpsUsed >= self.maxAirJumps then return end
+		        local sc = player:GetComponent("StateComponent")
+		        if grounded then
+		            local mc = player:GetComponent("MovementComponent")
+		            if mc ~= nil then mc:Jump() end
+		            -- TEMP: baseline for jump-sequence peak measurement (remove after calibration)
+		            self.jumpSeqBaseY = player.TransformComponent.WorldPosition.y
+		            self.jumpSeqPeakY = 0.0
+		        else
+		            -- MovementComponent:Jump() only takes effect while grounded in this engine, so
+		            -- the air jump (double jump) uses RigidbodyComponent:JustJump() directly with a
+		            -- rate well above the base WalkJump, so it reads as clearly higher than a single
+		            -- jump. Force-restarting the jump pose (legs kick out) marks the beat visually
+		            -- instead of just continuing the same falling animation.
+		            self.airJumpsUsed = self.airJumpsUsed + 1
+		            if rb ~= nil then rb:JustJump(Vector2(0, self.DoubleJumpRate)) end
+		            local flailEvent = BodyActionStateChangeEvent()
+		            flailEvent.ActionState = MapleAvatarBodyActionState.Fall
+		            flailEvent.needResetAction = true
+		            player:SendEvent(flailEvent)
+		        end
+		        if sc ~= nil then sc:ChangeState("JUMP") end
+		        log("[RhythmLogic] jump grounded=" .. tostring(grounded) .. " airJumpsUsed=" .. tostring(self.airJumpsUsed))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnMiss(integer laneIdx)
+		        self.combo = 0
+		        self:SetFeedbackColor(Color(1.0, 0.3, 0.3, 1.0))
+		        self:ShowFeedback("MISS")
+		        self:PlayMissFeel()
+		        self:UpdateComboUI()
+		        -- A missed arrow is what makes its hazard hurt, on any lane. Damage is
+		        -- charged here, on the beat, rather than on physical contact -- see the
+		        -- note in ObstacleManager.OnUpdate for why contact proved unusable.
+		        -- HP is not touched here any more: RequestMiss charges the server's
+		        -- PlayerComponent.Hp, and the resulting value comes back through
+		        -- SetHpDisplay. One number, one owner.
+		        if self.HAZARDS_ENABLED then
+		            _ObstacleManager:RequestMiss(laneIdx)
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetHpDisplay(number hp, number maxHp)
+		        -- Server -> HUD mirror. Death is decided server-side and arrives via
+		        -- ObstacleManager:NotifyPlayerDead, never from this value.
+		        self.hp = math.floor(hp)
+		        if maxHp > 0 then self.MAX_HP = math.floor(maxHp) end
+		        self:UpdateHPBar()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateHPBar()
+		        -- Linear bar = Sliced fill resized by WIDTH, not FillAmount. FillAmount
+		        -- clips the sprite's UVs, which warps the 9-slice border at every value.
+		        if self.hpBarFillEntity == nil or not isvalid(self.hpBarFillEntity) then return end
+		        local ratio = 0.0
+		        if self.MAX_HP > 0 then ratio = self.hp / self.MAX_HP end
+		        if ratio < 0.0 then ratio = 0.0 end
+		        if ratio > 1.0 then ratio = 1.0 end
+		        local rt = self.hpBarFillEntity:GetComponent("UITransformComponent")
+		        if rt ~= nil then
+		            rt.RectSize = Vector2(self.HP_BAR_FULL_WIDTH * ratio, rt.RectSize.y)
+		        end
+		        local sg = self.hpBarFillEntity:GetComponent("SpriteGUIRendererComponent")
+		        if sg ~= nil then
+		            if ratio > 0.5 then
+		                sg.Color = Color(0.35, 0.92, 0.45, 1.0)
+		            elseif ratio > 0.25 then
+		                sg.Color = Color(1.0, 0.85, 0.25, 1.0)
+		            else
+		                sg.Color = Color(1.0, 0.32, 0.3, 1.0)
+		            end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void WireGameOverButtons()
+		        -- Connected once at startup rather than per game-over, so repeated
+		        -- deaths cannot stack duplicate handlers on the same button.
+		        if self.btnRestart ~= nil and isvalid(self.btnRestart) then
+		            self.restartHandler = self.btnRestart.Entity:ConnectEvent(ButtonClickEvent, function()
+		                self:RestartGame()
+		            end)
+		        end
+		        if self.btnHome ~= nil and isvalid(self.btnHome) then
+		            self.homeHandler = self.btnHome.Entity:ConnectEvent(ButtonClickEvent, function()
+		                self:GoHome()
+		            end)
+		        end
+		        log("[RhythmLogic] game-over buttons wired")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void GoHome()
+		        -- "Home" now leaves the game scene for the menu scene. Reset the round
+		        -- first so this map is clean if the player comes back, then teleport.
+		        -- TitleScreen's own map watcher raises the menu on arrival -- calling
+		        -- Show() here would flash it over the game map before the load.
+		        self:RestartGame()
+		        self.gameStarted = false
+		        self:StopBgm()
+		        local player = _UserService.LocalPlayer
+		        if player == nil or not isvalid(player) then
+		            log("[RhythmLogic] Home pressed but no local player")
+		            return
+		        end
+		        local mapName = self.MenuMapName
+		        local spawn = self.MenuSpawnPos
+		        _TeleportService:TeleportToMapPosition(player, spawn, mapName)
+		        log("[RhythmLogic] Home pressed -> teleporting to " .. mapName)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartGame(string diff)
+		        -- Entry point for TitleScreen's Start button. Locks in the tier, then
+		        -- runs the same reset the game-over Restart button uses.
+		        self.difficulty = diff
+		        self:RestartGame()
+		        -- BGM is installed by ApplyStage(1) inside RestartGame -> ApplyDifficulty,
+		        -- so there is no separate StartBgm here any more (a second call would
+		        -- restart the track a frame after the stage already started it).
+		        log("[RhythmLogic] StartGame diff=" .. diff .. " stage=" .. tostring(self.stage)
+		            .. " spawn=" .. tostring(self.SPAWN_INTERVAL)
+		            .. " noteSpeed=" .. tostring(self.NOTE_SPEED))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyDifficulty()
+		        -- Difficulty scales the ground scroll, not NOTE_SPEED directly: the
+		        -- arrow/obstacle pairing assumes both move at the same screen rate
+		        -- (see the UI_PX_PER_WORLD_UNIT note), so NOTE_SPEED is re-derived
+		        -- from the run speed afterwards.
+		        -- Difficulty only picks the STARTING point of the stage ramp now.
+		        -- ApplyStage does the actual install (speed / density / windows / BGM)
+		        -- so the round-start path and the promotion path stay identical.
+		        local speedMult = 1.0
+		        local beats = self.BeatsPerNoteNormal
+		        if self.difficulty == "easy" then
+		            beats = self.BeatsPerNoteEasy
+		            speedMult = 0.8
+		        elseif self.difficulty == "hard" then
+		            beats = self.BeatsPerNoteHard
+		            speedMult = 1.3
+		        end
+		        self.difficultySpeedMult = speedMult
+		        self.difficultyBeats = beats
+		        self:ApplyStage(1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void TriggerGameOver()
+		        -- Guard re-entry: several hazards can land in one frame, and each one
+		        -- would otherwise re-run the teardown and re-issue RequestClearAll.
+		        if self.gameOver then return end
+		        self.gameOver = true
+		        -- Dying mid-hit-stop would otherwise leave the client clock slowed
+		        -- with nothing left running to put it back.
+		        self:ClearHitStop()
+		        self:StopBgm()
+		        for i = 1, 20 do
+		            self.noteActive[i] = false
+		            local e = self.noteEntities[i]
+		            if e ~= nil and isvalid(e) then e.Enable = false end
+		        end
+		        -- Dim the field and raise the game-over window with its two buttons.
+		        if self.darkOverlayEntity ~= nil and isvalid(self.darkOverlayEntity) then
+		            self.darkOverlayEntity.Enable = true
+		        end
+		        if self.gameOverPanel ~= nil and isvalid(self.gameOverPanel) then
+		            self.gameOverPanel.Enable = true
+		        end
+		        -- Wipe any live world obstacles on game over.
+		        _ObstacleManager:RequestClearAll()
+		        local player = _UserService.LocalPlayer
+		        if player ~= nil and isvalid(player) then
+		            local sc = player:GetComponent("StateComponent")
+		            if sc ~= nil then sc:ChangeState("DEAD") end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestartGame()
+		        -- Clear anything the previous round left mid-animation.
+		        self:ClearHitStop()
+		        self.feedbackPopTimer = 0.0
+		        self.comboPopTimer = 0.0
+		        self:ApplyPopScale(self.feedbackEntity, 0.0)
+		        self:ApplyPopScale(self.comboEntity, 0.0)
+		        for lane = 1, 4 do
+		            self.keyFlashTimers[lane] = 0.0
+		            self:SetLaneFlashAlpha(lane, self.KEY_FLASH_IDLE_ALPHA)
+		        end
+		        self.hp = 100
+		        self.score = 0
+		        self.combo = 0
+		        self.gameOver = false
+		        self.stage = 1
+		        self.stageBannerTimer = 0.0
+		        -- Re-derives SPAWN_INTERVAL / RunSpeed / NOTE_SPEED from the chosen
+		        -- tier. Previously these were hardcoded here, so a restart after a
+		        -- Stage 2 boost kept running at the boosted 1.5x scroll speed.
+		        self:ApplyDifficulty()
+		        self.spawnTimer = 0.0
+		        self.feedbackTimer = 0.0
+		        self.noteCounter = 0
+		        self.airJumpsUsed = 0
+		        -- Start the next run on a phrase boundary rather than mid-staircase.
+		        self.currentPattern = nil
+		        self.patternIndex = 0
+		        for i = 1, 20 do
+		            self.noteActive[i] = false
+		            local e = self.noteEntities[i]
+		            if e ~= nil and isvalid(e) then e.Enable = false end
+		        end
+		        -- Clear all world obstacles and restore player HP on restart.
+		        _ObstacleManager:RequestClearAll()
+		        if self.gameOverPanel ~= nil and isvalid(self.gameOverPanel) then
+		            self.gameOverPanel.Enable = false
+		        end
+		        if self.gameOverEntity ~= nil and isvalid(self.gameOverEntity) then
+		            self.gameOverEntity.Enable = false
+		        end
+		        if self.restartHintEntity ~= nil and isvalid(self.restartHintEntity) then
+		            self.restartHintEntity.Enable = false
+		        end
+		        if self.darkOverlayEntity ~= nil and isvalid(self.darkOverlayEntity) then
+		            self.darkOverlayEntity.Enable = false
+		        end
+		        if self.stageBannerEntity ~= nil and isvalid(self.stageBannerEntity) then
+		            self.stageBannerEntity.Enable = false
+		        end
+		        self:UpdateHPBar()
+		        self:UpdateScoreUI()
+		        self:UpdateComboUI()
+		        self:SetFeedbackText("")
+		        local player = _UserService.LocalPlayer
+		        if player ~= nil and isvalid(player) then
+		            local sc = player:GetComponent("StateComponent")
+		            if sc ~= nil then sc:ChangeState("IDLE") end
+		        end
+		        -- Last: the round is only live once every reset above has landed.
+		        -- GoHome() flips this straight back to false to hold at the title.
+		        self.gameStarted = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowFeedback(string text)
+		        self:SetFeedbackText(text)
+		        self.feedbackTimer = self.FEEDBACK_DURATION
+		        self:PopFeedback()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetFeedbackText(string text)
+		        if self.feedbackEntity ~= nil and isvalid(self.feedbackEntity) then
+		            local t = self.feedbackEntity:GetComponent("TextComponent")
+		            if t ~= nil then t.Text = text end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetFeedbackColor(Color c)
+		        if self.feedbackEntity ~= nil and isvalid(self.feedbackEntity) then
+		            local t = self.feedbackEntity:GetComponent("TextComponent")
+		            if t ~= nil then t.FontColor = c end
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateScoreUI()
+		        -- ScoreText is new UI, so it carries TextGUIRendererComponent -- the
+		        -- component UIBuilder emits. The older HUD text in this file
+		        -- (ComboText / JudgmentFeedback) predates it and still uses the legacy
+		        -- TextComponent, so the two are read with different accessors on
+		        -- purpose. Reading the wrong one returns nil and the text silently
+		        -- never updates.
+		        if self.scoreEntity ~= nil and isvalid(self.scoreEntity) then
+		            local t = self.scoreEntity:GetComponent("TextGUIRendererComponent")
+		            if t ~= nil then t.Text = tostring(self.score) end
+		        end
+		        self:CheckStageTransition()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CheckStageTransition()
+		        -- Promote as far as the score allows. A `while` rather than a single
+		        -- `if` so a big score jump (or a threshold edit) can never strand the
+		        -- player one stage behind.
+		        if self.stageScoreGate == nil then self:BuildStageTable() end
+		        while self.stage < self.MAX_STAGE
+		            and self.score >= self.stageScoreGate[self.stage + 1] do
+		            self:ApplyStage(self.stage + 1)
+		            self:ShowStageBanner(self.stage)
+		        end
+		        -- NOTE: the old EnterStage2 also switched DarkOverlay on and never
+		        -- switched it back, so stage 2 onwards played under the game-over
+		        -- dimmer. Dropped -- the banner, the new track and the speed jump
+		        -- already announce the change, and dimming fights the lane readability.
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateComboUI()
+		        -- The combo counter is the "one more run" hook, so it escalates:
+		        -- white -> yellow -> orange -> red, growing as it climbs, and every
+		        -- ComboMilestone earns its own sting. Losing all of that at once is
+		        -- what makes a dropped note sting.
+		        if self.comboEntity ~= nil and isvalid(self.comboEntity) then
+		            local t = self.comboEntity:GetComponent("TextComponent")
+		            if t ~= nil then
+		                if self.combo >= 2 then
+		                    t.Text = tostring(self.combo) .. " COMBO"
+		                    if self.combo >= 30 then
+		                        t.FontColor = Color(1.0, 0.35, 0.3, 1.0)
+		                        t.FontSize = 60
+		                    elseif self.combo >= 20 then
+		                        t.FontColor = Color(1.0, 0.6, 0.2, 1.0)
+		                        t.FontSize = 52
+		                    elseif self.combo >= 10 then
+		                        t.FontColor = Color(1.0, 0.93, 0.27, 1.0)
+		                        t.FontSize = 46
+		                    else
+		                        t.FontColor = Color(1.0, 1.0, 1.0, 1.0)
+		                        t.FontSize = 38
+		                    end
+		                else
+		                    t.Text = ""
+		                end
+		            end
+		        end
+		        if self.combo > 0 and self.combo % self.ComboMilestone == 0 then
+		            _SoundService:PlaySound(self.SfxCombo, self.SfxComboVolume)
+		            self:ShakeCam(self.ShakePerfect)
+		            log("[RhythmLogic] combo milestone " .. tostring(self.combo))
+		        end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		        -- Restore the clock before tearing down; nothing else will after this.
+		        self:ClearHitStop()
+		        if self.keyHandler ~= nil then
+		            _InputService:DisconnectEvent(KeyDownEvent, self.keyHandler)
+		        end
+		        self.keyHandler = nil
+		        if self.restartHandler ~= nil and self.btnRestart ~= nil and isvalid(self.btnRestart) then
+		            self.btnRestart.Entity:DisconnectEvent(ButtonClickEvent, self.restartHandler)
+		        end
+		        self.restartHandler = nil
+		        if self.homeHandler ~= nil and self.btnHome ~= nil and isvalid(self.btnHome) then
+		            self.btnHome.Entity:DisconnectEvent(ButtonClickEvent, self.homeHandler)
+		        end
+		        self.homeHandler = nil
+	end
+
+end
+

@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "node .cursor/hooks/skill-read-guard/skill-read-guard.cjs",
+        "timeout": 5
+      },
+      {
+        "command": "node .cursor/hooks/structured-file-guard/structured-file-guard.cjs",
+        "timeout": 5
+      },
+      {
+        "command": "node .cursor/hooks/structured-file-guard/structured-file-guard.cjs",
+        "timeout": 5
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "node .cursor/hooks/mlua-lsp/mlua-diagnose-post-tool-use.cjs",
+        "timeout": 120
+      },
+      {
+        "command": "node .cursor/hooks/skill-log/skill-log.cjs",
+        "timeout": 5
+      },
+      {
+        "command": "node .cursor/hooks/mcp-log/mcp-log.cjs",
+        "timeout": 5
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "node .cursor/hooks/mlua-lsp/mlua-session-start.cjs",
+        "timeout": 120
+      },
+      {
+        "command": "node .cursor/hooks/update-check/update-check.cjs",
+        "timeout": 10
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "node .cursor/hooks/core-version-check/core-version-check.cjs",
+        "timeout": 5
+      },
+      {
+        "command": "node .cursor/hooks/skill-router-reminder/skill-router-reminder.cjs",
+        "timeout": 5
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "node .cursor/hooks/mlua-lsp/mlua-session-end.cjs",
+        "timeout": 20
+      }
+    ]
+  }
+}

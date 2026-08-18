@@ -1,0 +1,282 @@
+@Logic
+script TitleScreen extends Logic
+
+    -- All UUIDs below are injected by the .ui builder's binding pass
+    -- (b.write(path, { bind = ... })), so nothing here needs drag-binding in Maker.
+    -- root wraps the dimmer + window: toggling this one entity raises or drops the
+    -- whole title screen while the root UIGroup itself stays DefaultShow=true.
+    property Entity root = "42cce730-747c-4555-a1ed-6e94707fcfb2"
+
+    property ButtonComponent btnStart = "9787801b-c823-4387-bb65-51384d722f00"
+
+    property ButtonComponent btnEasy = "1f8c55c4-36b6-4641-b2de-72730ea2f1e7"
+
+    property ButtonComponent btnNormal = "fe251417-f914-486c-970f-8954a1bf7d40"
+
+    property ButtonComponent btnHard = "eddc8da6-3ea8-4e6e-9d50-871fcde3e037"
+
+    -- Same three entities as the buttons above, bound as their background sprite so
+    -- the selected tier can be tinted without touching the label.
+    property SpriteGUIRendererComponent easyBg = "1f8c55c4-36b6-4641-b2de-72730ea2f1e7"
+
+    property SpriteGUIRendererComponent normalBg = "fe251417-f914-486c-970f-8954a1bf7d40"
+
+    property SpriteGUIRendererComponent hardBg = "eddc8da6-3ea8-4e6e-9d50-871fcde3e037"
+
+    property TextGUIRendererComponent diffDesc = "18644e0d-2255-4135-8b9f-61cdb2b0ad95"
+
+    -- Main-menu extras. UUIDs are injected by the .ui builder's binding pass.
+    property ButtonComponent btnHowTo = "4bed4442-39bf-4899-8d7d-0e95142c9fb7"
+
+    property ButtonComponent btnCredits = "36ef3ea1-81e2-40fa-875a-f2b6ee18ce22"
+
+    -- Info overlays. Children of Root (not their own UIGroup) so they ride the
+    -- title screen's show/hide and cannot outlive it.
+    property Entity howToPanel = "88603fea-ebac-4d49-9846-5482f85191c5"
+
+    property Entity creditsPanel = "24786fc9-5a63-4fae-a77e-e0f67d8cc873"
+
+    property ButtonComponent btnHowToClose = "d677fa67-9256-4b9a-b37d-0ea9baa769fb"
+
+    property ButtonComponent btnCreditsClose = "625c40fb-cf58-474f-872c-20d9dda809e8"
+
+    -- Passed to RhythmLogic:StartGame on the start press. "easy" / "normal" / "hard".
+    -- This Logic is a world singleton that survives map transitions, so the value
+    -- picked in the menu map is still here when the game map loads -- no
+    -- DataStorage round-trip needed to carry it across.
+    property string difficulty = "normal"
+
+    -- The menu now lives in its own scene. Play teleports to the game map instead
+    -- of starting the run underneath the overlay.
+    property string MenuMapName = "mainmenu"
+
+    property string GameMapName = "map01"
+
+    -- Landing spot in the game map. map01's footholds span x -8.9..477.8 with the
+    -- surface at y ~0.04, so this drops the player just above the start of the run.
+    property Vector3 GameSpawnPos = Vector3(0, 1, 0)
+
+    -- Set between pressing Play and the game map actually being live, so the run is
+    -- only started once the player is really there.
+    property boolean awaitingGameMap = false
+
+    -- @Logic never receives OnMapEnter/OnMapLeave -- they are dispatched to
+    -- Components only. Polling the player's CurrentMap in OnUpdate is the
+    -- documented way for a Logic to react to a map change.
+    property string lastMapName = ""
+
+    -- Project-standard UI SFX (msw-ui-system/references/ui-sound.md).
+    property string clickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+
+    property string hoverSoundRUID = "159bf70a74634bfc8e91a29e527a4be5"
+
+    property number sfxVolume = 1.0
+
+    property any clickHandlers = nil
+
+    property any hoverHandlers = nil
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Wires every title button once and raises the screen over the running world.
+        -- The player keeps auto-running behind the dimmer, which doubles as the
+        -- title backdrop -- RhythmLogic only gates note spawning, not the run.
+        self.clickHandlers = {}
+        self.hoverHandlers = {}
+        self:WireButton(self.btnStart, function() self:OnStartPressed() end)
+        self:WireButton(self.btnEasy, function() self:SelectDifficulty("easy") end)
+        self:WireButton(self.btnNormal, function() self:SelectDifficulty("normal") end)
+        self:WireButton(self.btnHard, function() self:SelectDifficulty("hard") end)
+        self:WireButton(self.btnHowTo, function() self:OpenPanel(self.howToPanel) end)
+        self:WireButton(self.btnCredits, function() self:OpenPanel(self.creditsPanel) end)
+        self:WireButton(self.btnHowToClose, function() self:ClosePanels() end)
+        self:WireButton(self.btnCreditsClose, function() self:ClosePanels() end)
+        self:ClosePanels()
+        self:SelectDifficulty(self.difficulty)
+        -- Only raise the menu if we actually start in the menu scene. The world may
+        -- boot straight into the game map, and OnUpdate's watcher will show/hide on
+        -- any later transition anyway.
+        local mapName = self:CurrentMapName()
+        self.lastMapName = mapName
+        if mapName == self.GameMapName then
+            self:Hide()
+        else
+            self:Show()
+        end
+        log("[TitleScreen] OnBeginPlay map=" .. mapName
+            .. " root=" .. tostring(self.root ~= nil and isvalid(self.root)))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void WireButton(ButtonComponent btn, any onClick)
+        -- Click + hover SFX are attached here so every title button behaves the same.
+        -- Hover needs UITouchReceiveComponent on the entity; the builder adds it.
+        if btn == nil or not isvalid(btn) then
+            log("[TitleScreen] WireButton skipped -- button not bound")
+            return
+        end
+        local e = btn.Entity
+        local click = e:ConnectEvent(ButtonClickEvent, function()
+            _SoundService:PlaySound(self.clickSoundRUID, self.sfxVolume)
+            onClick()
+        end)
+        table.insert(self.clickHandlers, { entity = e, cb = click })
+        local hover = e:ConnectEvent(UITouchEnterEvent, function()
+            _SoundService:PlaySound(self.hoverSoundRUID, self.sfxVolume)
+        end)
+        table.insert(self.hoverHandlers, { entity = e, cb = hover })
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenPanel(Entity panel)
+        -- Only one overlay at a time; opening one closes the other.
+        self:ClosePanels()
+        if panel ~= nil and isvalid(panel) then
+            panel.Enable = true
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ClosePanels()
+        -- Enable (not Visible): a Visible=false panel would keep swallowing clicks
+        -- meant for the menu buttons underneath.
+        if self.howToPanel ~= nil and isvalid(self.howToPanel) then
+            self.howToPanel.Enable = false
+        end
+        if self.creditsPanel ~= nil and isvalid(self.creditsPanel) then
+            self.creditsPanel.Enable = false
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SelectDifficulty(string diff)
+        -- Highlights the picked tier and previews what it actually changes.
+        -- Nothing is applied to the game here -- StartGame does that.
+        self.difficulty = diff
+        self:PaintButton(self.easyBg, diff == "easy")
+        self:PaintButton(self.normalBg, diff == "normal")
+        self:PaintButton(self.hardBg, diff == "hard")
+        if self.diffDesc ~= nil and isvalid(self.diffDesc) then
+            -- 수치는 RhythmLogic 의 비트 그리드 실제값과 맞춘 것.
+            -- (BPM 120 기준: easy 2비트=1.0초 / normal 1.5비트=0.75초 / hard 1비트=0.5초)
+            if diff == "easy" then
+                self.diffDesc.Text = "느린 스크롤 (×0.8) · 노트 2비트 간격 · 입문용"
+            elseif diff == "hard" then
+                self.diffDesc.Text = "빠른 스크롤 (×1.3) · 노트 1비트 간격 · 숙련자용"
+            else
+                self.diffDesc.Text = "기본 스크롤 (×1.0) · 노트 1.5비트 간격 · 표준"
+            end
+        end
+        log("[TitleScreen] difficulty = " .. diff)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void PaintButton(SpriteGUIRendererComponent bg, boolean selected)
+        -- Selected tier gets the accent fill, the rest fall back to the panel tone.
+        if bg == nil or not isvalid(bg) then return end
+        if selected then
+            bg.Color = Color(0.24, 0.48, 0.98, 1.0)
+        else
+            bg.Color = Color(0.13, 0.15, 0.26, 1.0)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnStartPressed()
+        -- Leaves the menu scene for the game scene. StartGame is NOT called here --
+        -- the run must not begin until the game map is actually loaded, so it is
+        -- deferred to OnUpdate's arrival check via awaitingGameMap.
+        self:Hide()
+        self.awaitingGameMap = true
+        local player = _UserService.LocalPlayer
+        if player == nil or not isvalid(player) then
+            log("[TitleScreen] start pressed but no local player")
+            return
+        end
+        _TeleportService:TeleportToMapPosition(player, self.GameSpawnPos, self.GameMapName)
+        log("[TitleScreen] start pressed diff=" .. self.difficulty
+            .. " -> teleporting to " .. self.GameMapName)
+    end
+
+    @ExecSpace("ClientOnly")
+    method string CurrentMapName()
+        -- "" while the player or map is not resolvable yet (early frames after a
+        -- transition), which the caller treats as "no change".
+        local player = _UserService.LocalPlayer
+        if player == nil or not isvalid(player) then return "" end
+        local map = player.CurrentMap
+        if map == nil or not isvalid(map) then return "" end
+        return map.Name
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Map-change watcher. Runs every frame but only acts on an actual
+        -- transition, so the cost is one name comparison.
+        local mapName = self:CurrentMapName()
+        if mapName == "" or mapName == self.lastMapName then return end
+        local previous = self.lastMapName
+        self.lastMapName = mapName
+        log("[TitleScreen] map changed " .. previous .. " -> " .. mapName)
+
+        if mapName == self.GameMapName then
+            -- Arrived in the game scene. Start the run with whatever the menu picked.
+            self:Hide()
+            if self.awaitingGameMap then
+                self.awaitingGameMap = false
+                if _RhythmLogic ~= nil then
+                    _RhythmLogic:StartGame(self.difficulty)
+                    log("[TitleScreen] game started in " .. mapName .. " diff=" .. self.difficulty)
+                else
+                    log("[TitleScreen] _RhythmLogic missing -- game not started")
+                end
+            end
+        elseif mapName == self.MenuMapName then
+            -- Back at the menu (world start, or the game-over Home button).
+            self:Show()
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Show()
+        -- Called on world start and again by RhythmLogic:GoHome().
+        if self.root ~= nil and isvalid(self.root) then
+            self.root.Enable = true
+            -- Coming back from a run must land on the menu itself, never on a
+            -- leftover 조작법/크레딧 overlay.
+            self:ClosePanels()
+            log("[TitleScreen] shown")
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Hide()
+        -- Enable (not Visible): Visible=false would keep the dimmer swallowing clicks.
+        if self.root ~= nil and isvalid(self.root) then
+            self.root.Enable = false
+            log("[TitleScreen] hidden")
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Handlers are stored per entity so repeated reloads cannot stack duplicates.
+        if self.clickHandlers ~= nil then
+            for _, rec in ipairs(self.clickHandlers) do
+                if isvalid(rec.entity) then
+                    rec.entity:DisconnectEvent(ButtonClickEvent, rec.cb)
+                end
+            end
+        end
+        if self.hoverHandlers ~= nil then
+            for _, rec in ipairs(self.hoverHandlers) do
+                if isvalid(rec.entity) then
+                    rec.entity:DisconnectEvent(UITouchEnterEvent, rec.cb)
+                end
+            end
+        end
+        self.clickHandlers = {}
+        self.hoverHandlers = {}
+    end
+
+end

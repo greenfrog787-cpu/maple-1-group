@@ -1,0 +1,110 @@
+@Component
+script AutoRunner extends Component
+
+	property number ScrollSpeed = 4.0
+
+	property number SpawnInterval = 3.0
+
+	property number SpawnAheadDistance = 15.0
+
+	property number CleanupDistance = 5.0
+
+	property string MonsterModel1 = "mushroom"
+
+	property string MonsterModel2 = "boss"
+
+	property number spawnTimer = 0.0
+
+	property any spawnedMonsters = nil
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		        -- AutoRunner scroll mode: monsters scroll right→left, player stays still
+		        log("[AutoRunner] OnBeginPlay")
+		        self.spawnTimer = 0.0
+		        self.spawnedMonsters = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		        local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+		        if users == nil or #users == 0 then return end
+		
+		        local playerX = users[1].TransformComponent.Position.x
+		
+		        -- Spawn timer
+		        self.spawnTimer = self.spawnTimer + delta
+		        if self.spawnTimer >= self.SpawnInterval then
+		            self.spawnTimer = 0.0
+		            self:SpawnMonster(playerX)
+		        end
+		
+		        -- Move monsters left + cleanup
+		        local i = #self.spawnedMonsters
+		        while i >= 1 do
+		            local entity = self.spawnedMonsters[i]
+		            if entity == nil or not isvalid(entity) then
+		                table.remove(self.spawnedMonsters, i)
+		            else
+		                local mc = entity:GetComponent("MovementComponent")
+		                if mc ~= nil then
+		                    mc:MoveToDirection(Vector2(-1, 0), delta)
+		                end
+		
+		                local ex = entity.TransformComponent.Position.x
+		                if ex < playerX - self.CleanupDistance then
+		                    log("[AutoRunner] Cleanup monster at x=" .. tostring(ex))
+		                    entity:Destroy()
+		                    table.remove(self.spawnedMonsters, i)
+		                end
+		            end
+		            i = i - 1
+		        end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnMonster(number playerX)
+		        local modelId = self.MonsterModel1
+		        if math.random(1, 2) == 2 then
+		            modelId = self.MonsterModel2
+		        end
+		
+		        local spawnX = playerX + self.SpawnAheadDistance
+		        local map = self.Entity.CurrentMap
+		        if map == nil then
+		            log("[AutoRunner] CurrentMap nil")
+		            return
+		        end
+		
+		        local name = modelId .. "_s" .. tostring(math.floor(spawnX * 10))
+		        local entity = _SpawnService:SpawnByModelId(modelId, name, Vector3(spawnX, 1.0, 0), map)
+		        if entity ~= nil then
+		            -- Disable AI so we control movement manually
+		            local ai1 = entity:GetComponent("AIChaseComponent")
+		            if ai1 ~= nil then ai1.Enable = false end
+		            local ai2 = entity:GetComponent("AIWanderComponent")
+		            if ai2 ~= nil then ai2.Enable = false end
+		            -- The shipped monster models have no hit VFX; add it so player hits feel impactful.
+		            if entity:GetComponent("HitEffectSpawnerComponent") == nil then
+		                entity:AddComponent("HitEffectSpawnerComponent")
+		            end
+		            log("[AutoRunner] Spawned " .. modelId .. " at x=" .. tostring(spawnX))
+		            table.insert(self.spawnedMonsters, entity)
+		        else
+		            log("[AutoRunner] SpawnByModelId failed for " .. modelId)
+		        end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		        for i = 1, #self.spawnedMonsters do
+		            local entity = self.spawnedMonsters[i]
+		            if entity ~= nil and isvalid(entity) then
+		                entity:Destroy()
+		            end
+		        end
+		        self.spawnedMonsters = {}
+		        log("[AutoRunner] OnEndPlay done")
+	end
+
+end

@@ -1,0 +1,23 @@
+{
+  "Id": "",
+  "GameId": "",
+  "EntryKey": "directory://b7734cf6ec6544bbb81ab2b62bef8afc",
+  "ContentType": "x-mod/directory",
+  "Content": "",
+  "Usage": 0,
+  "UsePublish": 1,
+  "UseService": 0,
+  "CoreVersion": "26.5.0.0",
+  "StudioVersion": "",
+  "DynamicLoading": 0,
+  "ContentProto": {
+    "Use": "Json",
+    "Json": {
+      "entry_id": "directory://b7734cf6ec6544bbb81ab2b62bef8afc",
+      "name": "Runner",
+      "lock": false,
+      "folding": false,
+      "nameEditable": true
+    }
+  }
+}
